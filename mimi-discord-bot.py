@@ -152,12 +152,14 @@ async def send_thoughtful_reply(message: discord.Message, reply: str, source_tex
 
 
 
-# ---------- AI連携（Gemini・無料枠） ----------
-# 環境変数 GEMINI_API_KEY があれば、会話の返事をAIが考えて作る。
-# キーが無い／APIが失敗したときは、ルール式の chat_reply に切り替える。
+# ---------- AI連携（Groq / Gemini・無料枠） ----------
+# GROQ_API_KEY があれば Groq（速くて混みにくいLLM）を優先し、
+# ダメなら GEMINI_API_KEY の Gemini、それも無ければルール返信に切り替える。
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "").strip(), "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-flash-latest"] if m]
-_working_model: str | None = None  # 実際に使えたモデルを覚えておく
+_working_gemini_model: str | None = None
 AI_SYSTEM_PROMPT = (
     "あなたはDiscordサーバーの見守りボット「マッキー」です。"
     "相手の言った内容にちゃんと向き合って、考えてから返事をしてください。"
@@ -168,7 +170,48 @@ AI_SYSTEM_PROMPT = (
     "サーバーの安全を見守るのが仕事で、スパムや禁止ワードを見つけてログに記録しています。"
     "知らないことは正直に「わかんないや」と言ってください。うそはつかないでください。"
 )
-_ai_history: dict[int, list[dict]] = defaultdict(list)
+# 会話履歴は (話し手, 本文) の形で持ち、各AIの形式に変換して渡す
+_ai_history: dict[int, list[tuple[str, str]]] = defaultdict(list)
+
+
+def _groq_call(model: str, messages: list[dict], timeout: float = 20) -> str:
+    """GroqのLLMを1回呼ぶ（OpenAI互換API）。"""
+    payload = {"model": model, "messages": messages, "max_tokens": 800, "temperature": 0.9}
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.load(resp)
+    return (data["choices"][0]["message"]["content"] or "").strip()
+
+
+def _groq_generate(history: list[tuple[str, str]], text: str) -> str:
+    """Groqで返事を作る。混雑時はモデルを替えながら少し粘る。"""
+    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
+    for who, body in history:
+        messages.append({"role": "user" if who == "user" else "assistant", "content": body})
+    messages.append({"role": "user", "content": text})
+    deadline = time.monotonic() + 60
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        for model in GROQ_MODELS:
+            try:
+                reply = _groq_call(model, messages, timeout=20)
+                print(f"[AI] 使用モデル: Groq {model}")
+                return reply
+            except urllib.error.HTTPError as e:
+                last_err = e
+                if e.code not in (400, 404, 429, 503):
+                    raise
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last_err = e
+        if time.monotonic() + 4 < deadline:
+            time.sleep(4)
+    assert last_err is not None
+    raise last_err
 
 
 def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
@@ -211,25 +254,21 @@ def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
 
 
 def _gemini_generate(contents: list[dict]) -> str:
-    """Geminiを呼ぶ（同期処理なので to_thread から使う）。
-
-    混雑（503など）はGoogle側の一時的なものなので、あきらめずに
-    モデルを替えながら最大約90秒粘る。当たったモデルを覚えて次回から優先する。
-    """
-    global _working_model
+    """Geminiを呼ぶ。混雑時はモデルを替えながら最大約90秒粘る。"""
+    global _working_gemini_model
     deadline = time.monotonic() + 90
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        candidates = ([_working_model] if _working_model else []) + [m for m in GEMINI_MODELS if m != _working_model]
+        candidates = ([_working_gemini_model] if _working_gemini_model else []) + [m for m in GEMINI_MODELS if m != _working_gemini_model]
         for model in candidates:
             remaining = deadline - time.monotonic()
             if remaining <= 3:
                 break
             try:
                 text = _gemini_call(model, contents, timeout=min(20.0, remaining))
-                if _working_model != model:
-                    _working_model = model
-                    print(f"[AI] 使用モデル: {model}")
+                if _working_gemini_model != model:
+                    _working_gemini_model = model
+                    print(f"[AI] 使用モデル: Gemini {model}")
                 return text
             except urllib.error.HTTPError as e:
                 last_err = e
@@ -237,7 +276,6 @@ def _gemini_generate(contents: list[dict]) -> str:
                     raise
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = e
-        # 候補を一巡してダメなら、少し待って混雑が解けるのを待つ
         if time.monotonic() + 6 < deadline:
             time.sleep(6)
     assert last_err is not None
@@ -245,18 +283,27 @@ def _gemini_generate(contents: list[dict]) -> str:
 
 
 async def ai_reply(user_id: int, text: str) -> str | None:
-    """AIに考えてもらう返事。失敗したら None（呼び出し側がルール返信にする）。"""
+    """AIに考えてもらう返事（Groq優先→Gemini）。全部ダメなら None。"""
     history = _ai_history[user_id]
-    contents = list(history) + [{"role": "user", "parts": [{"text": text}]}]
-    try:
-        reply = await asyncio.to_thread(_gemini_generate, contents)
-    except Exception as e:
-        print(f"[AI] Gemini呼び出しに失敗: {e}")
-        return None
+    reply: str | None = None
+    if GROQ_API_KEY:
+        try:
+            reply = await asyncio.to_thread(_groq_generate, list(history), text)
+        except Exception as e:
+            print(f"[AI] Groq呼び出しに失敗: {e}")
+    if not reply and GEMINI_API_KEY:
+        contents = [
+            {"role": "user" if who == "user" else "model", "parts": [{"text": body}]}
+            for who, body in history
+        ] + [{"role": "user", "parts": [{"text": text}]}]
+        try:
+            reply = await asyncio.to_thread(_gemini_generate, contents)
+        except Exception as e:
+            print(f"[AI] Gemini呼び出しに失敗: {e}")
     if not reply:
         return None
-    history.append({"role": "user", "parts": [{"text": text}]})
-    history.append({"role": "model", "parts": [{"text": reply}]})
+    history.append(("user", text))
+    history.append(("ai", reply))
     del history[:-12]  # 直近のやりとりだけ覚える
     return reply[:500]
 
@@ -269,7 +316,7 @@ async def smart_reply(user_id: int, text: str) -> str:
         if name:
             user_names[user_id] = name
             return f"{name}って言うんだね！覚えたよ♪ よろしく、{name}！"
-    if GEMINI_API_KEY:
+    if GROQ_API_KEY or GEMINI_API_KEY:
         reply = await ai_reply(user_id, text)
         if reply:
             return reply
@@ -597,7 +644,7 @@ async def log_plain_message(message: discord.Message) -> None:
 async def on_ready():
     global _tree_synced, _maintenance_started
     print(f"ログインしました: {bot.user} / マッキーボット起動OK")
-    print('AI連携（Gemini）: ' + ('ON' if GEMINI_API_KEY else 'OFF（ルール返信）'))
+    print('AI連携: ' + ('Groq' if GROQ_API_KEY else 'Gemini' if GEMINI_API_KEY else 'OFF（ルール返信）'))
     guild_names = " / ".join(g.name for g in bot.guilds) or "なし"
     print(f"参加中のサーバー（{len(bot.guilds)}件）: {guild_names}", flush=True)
     if not _maintenance_started:
