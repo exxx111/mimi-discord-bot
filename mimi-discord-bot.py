@@ -23,8 +23,9 @@ Render等のWebサービスで動かす場合:
   !spamlog / /spamlog   スパム検知ログの最新10件を見る（管理者向け）
   !help_mimi / /help_mimi ヘルプ
 会話はメンション、DM、文に「みみ」を含めると返事するよ。
-サーバー内ではスパムっぽい投稿（連投・同じ文の繰り返し・リンク連投・大量メンション）を
-自動で見張って、見つけたらログに残すよ（消したりBANはしないよ）。
+サーバー内ではスパムっぽい投稿（連投・同じ文の繰り返し・リンク連投・大量メンション・
+招待リンク・同じ文字や絵文字の連打・改行荒らし）を自動で見張って、見つけたらログに残すよ
+（消したりBANはしないよ）。
 ログは「mimi-log」「みみログ」「spam-log」という名前のチャンネルがあればそこにも流すよ。
 """
 
@@ -225,16 +226,19 @@ def chat_reply(user_id: int, text: str) -> str | None:
 # メッセージの削除やBANはしない（検知と記録だけ）。
 JST = timezone(timedelta(hours=9))
 
-# 判定のしきい値
-BURST_COUNT = 5          # この件数を
-BURST_WINDOW = 10        # この秒数以内に送ったら「連投」
-REPEAT_COUNT = 4         # 同じ文をこの回数
+# 判定のしきい値（ガチガチ強化版）
+BURST_COUNT = 4          # この件数を
+BURST_WINDOW = 5         # この秒数以内に送ったら「連投」
+REPEAT_COUNT = 3         # 同じ文をこの回数
 REPEAT_WINDOW = 60       # この秒数以内に送ったら「繰り返し」
-LINK_COUNT = 3           # リンク付き投稿をこの件数
+LINK_COUNT = 2           # リンク付き投稿をこの件数
 LINK_WINDOW = 60         # この秒数以内に送ったら「リンク連投」
-MANY_LINKS_IN_ONE = 4    # 1通にこれ以上のURLがあれば即検知
-MANY_MENTIONS = 5        # 1通にこれ以上のメンションがあれば即検知
-FLAG_COOLDOWN = 60       # 同じ人を連続で記録しない間隔（秒）
+MANY_LINKS_IN_ONE = 3    # 1通にこれ以上のURLがあれば即検知
+MANY_MENTIONS = 4        # 1通にこれ以上のメンションがあれば即検知
+REPEAT_CHAR = 20         # 同じ文字がこれ以上連続したら即検知
+MANY_NEWLINES = 15       # 1通の改行がこれ以上なら即検知
+MANY_EMOJIS = 20         # 1通の絵文字がこれ以上なら即検知
+FLAG_COOLDOWN = 30       # 同じ人を連続で記録しない間隔（秒）
 LOG_KEEP = 100           # ログの最大保持件数
 LOG_CHANNEL_NAMES = ["mimi-log", "みみログ", "spam-log"]
 
@@ -246,6 +250,8 @@ _last_flagged: dict[tuple[int, int], float] = {}
 spam_log: list[dict] = []
 
 _URL_RE = re.compile(r"https?://|www\.|\.com|\.jp|\.net|\.io", re.IGNORECASE)
+_INVITE_RE = re.compile(r"discord\.gg/|discord(app)?\.com/invite/", re.IGNORECASE)
+_EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF☀-➿⬀-⯿]")
 
 
 def _normalize(text: str) -> str:
@@ -262,10 +268,19 @@ def _detect_spam(message: discord.Message) -> str | None:
     history.append((now, _normalize(content), url_count))
 
     # 1通で即検知するタイプ
+    if _INVITE_RE.search(content):
+        return "Discord招待リンクの投稿"
     if url_count >= MANY_LINKS_IN_ONE:
         return f"1通にリンクが{url_count}個"
     if len(message.mentions) >= MANY_MENTIONS:
         return f"1通にメンションが{len(message.mentions)}人"
+    if re.search(r"(.)\1{" + str(REPEAT_CHAR - 1) + r",}", content):
+        return f"同じ文字の{REPEAT_CHAR}連続以上の連打"
+    if content.count("\n") >= MANY_NEWLINES:
+        return f"改行が{MANY_NEWLINES}個以上の荒らし"
+    emoji_count = len(_EMOJI_RE.findall(content))
+    if emoji_count >= MANY_EMOJIS:
+        return f"絵文字が{emoji_count}個の連打"
 
     # 一定時間内の履歴で判定
     recent_all = [h for h in history if now - h[0] <= REPEAT_WINDOW]
