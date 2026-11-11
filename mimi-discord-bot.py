@@ -1006,6 +1006,62 @@ async def _ensis_daily_loop() -> None:
                 print(f"[エンシス] 送信に失敗: {e}")
 
 
+
+# ---------- 毎日の監視レポート（異常があったらDMで通知） ----------
+# 毎日21時（日本時間）に、その日たまった異常検知（スパム/禁止ワード等）を集計し、
+# 異常があった日だけ、通知先の人にDMで知らせる。異常なしの日は送らない。
+REPORT_HOUR = 21
+_report_user_id: int | None = None
+_report_since: datetime | None = None
+_report_last_day = ""
+
+
+async def _daily_report_loop() -> None:
+    global _report_since, _report_last_day
+    if _report_since is None:
+        _report_since = datetime.now(JST)
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(JST)
+        if now.hour != REPORT_HOUR or now.minute > 4:
+            continue
+        today = now.strftime("%Y-%m-%d")
+        if _report_last_day == today:
+            continue
+        _report_last_day = today
+        flagged = [
+            e for e in log_entries
+            if e.get("flagged") and _report_since is not None and e["time"] > _report_since
+        ]
+        _report_since = now
+        if not flagged:
+            print("[監視レポート] 異常なし（通知しません）")
+            continue
+        lines = [
+            f"⚠️ サーバー監視レポート（{now:%Y-%m-%d}）",
+            f"異常検知が {len(flagged)} 件ありました。最新のものから最大10件:",
+        ]
+        for e in flagged[-10:]:
+            lines.append(f"・[{e['time']:%H:%M}] {e['user']} ＠{e['channel']}（{e['guild']}）: {e['content'][:50]}（{e['reason']}）")
+        text = "\n".join(lines)
+        targets: set[int] = set()
+        if _report_user_id:
+            targets.add(_report_user_id)
+        for g in bot.guilds:
+            if g.owner_id:
+                targets.add(g.owner_id)
+        sent = 0
+        for uid in targets:
+            try:
+                user = bot.get_user(uid) or await bot.fetch_user(uid)
+                dm = await user.create_dm()
+                await dm.send(text)
+                sent += 1
+            except Exception as e:
+                print(f"[監視レポート] DM送信に失敗 ({uid}): {e}")
+        print(f"[監視レポート] 異常{len(flagged)}件を {sent} 人にDMで通知しました")
+
+
 # ---------- イベント＆コマンド ----------
 @bot.event
 async def on_ready():
@@ -1018,6 +1074,7 @@ async def on_ready():
         _maintenance_started = True
         asyncio.create_task(_maintenance_loop())
         asyncio.create_task(_ensis_daily_loop())
+        asyncio.create_task(_daily_report_loop())
     if not _tree_synced:
         try:
             synced = await bot.tree.sync()
@@ -1073,6 +1130,11 @@ async def on_message(message: discord.Message):
     mentioned = bot.user in message.mentions if bot.user else False
     called = "tempus" in message.content or "マッキー" in message.content or "警告bot" in message.content or "みみ" in message.content
     if is_dm or mentioned or called:
+        global _report_user_id
+        if is_dm or getattr(message.author, "guild_permissions", None) is not None and message.author.guild_permissions.manage_messages:
+            if _report_user_id != message.author.id:
+                _report_user_id = message.author.id
+                print(f"[監視レポート] 通知先を覚えた: {message.author}")
         clean = message.content
         if bot.user:
             clean = clean.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
