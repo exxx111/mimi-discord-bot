@@ -1,5 +1,5 @@
 """
-マッキー Discordボット - かわいい女の子キャラクター風 会話＆見守りボット
+tempus Discordボット - かわいい女の子キャラクター風 会話＆見守りボット
 
 使い方:
   1. pip install discord.py
@@ -8,21 +8,21 @@
        export DISCORD_TOKEN="あなたのトークン"
      Windows (PowerShell):  $env:DISCORD_TOKEN="あなたのトークン"
   4. python mimi-discord-bot.py
-  5. Bot の招待URLでサーバーに入れて、メンション or DM or 「マッキー」って呼んでね
+  5. Bot の招待URLでサーバーに入れて、メンション or DM or 「tempus」って呼んでね
 
 Render等のWebサービスで動かす場合:
   環境変数 PORT が設定されていれば、ヘルスチェック用の小さな
   HTTPサーバーが別スレッドで自動起動します。ローカルでは不要です。
 
 コマンドは無し。ただしログ確認だけスラッシュコマンド /log（管理者だけ）を残してある。
-会話はメンション、DM、文に「マッキー」を含めると返事するよ。
+会話はメンション、DM、文に「tempus」を含めると返事するよ。
 他のボットが話しかけてきたら、ボット同士でも会話するよ（無限ループ防止つき）。
 返事はすぐ送らず、「入力中…」を出して少し考えてから送るよ。
 環境変数 GEMINI_API_KEY があれば、会話はAI（Gemini）が考えて返事するよ。
 サーバー内では全ての投稿を1通ごとにログに記録するよ。スパムっぽい投稿（連投・同じ文の
 繰り返し・リンク連投・大量メンション・招待リンク・同じ文字や絵文字の連打・改行荒らし・
 指定した監視ワード）は🚨検知つきで記録するよ（消したりBANはしないよ）。
-ログは「mimi-log」「みみログ」「spam-log」「警告botログ」「マッキーログ」という名前のチャンネルがあればそこにも流すよ。
+ログは「mimi-log」「みみログ」「spam-log」「警告botログ」「tempusログ」という名前のチャンネルがあればそこにも流すよ。
 """
 
 import json
@@ -42,10 +42,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# ---------- キャラクター設定：マッキー ----------
-MIMI_NAME = "マッキー"
+# ---------- キャラクター設定：tempus ----------
+MIMI_NAME = "tempus"
 MIMI_PROFILE = (
-    "サーバーを見守る「マッキー」だよ。"
+    "サーバーを見守る「tempus」だよ。"
     "スパムや監視ワードを見張って、ログに残したり警告したりするよ。おしゃべりもできるよ。"
 )
 
@@ -197,7 +197,7 @@ def _groq_models() -> list[str]:
 GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "").strip(), "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-flash-latest"] if m]
 _working_gemini_model: str | None = None
 AI_SYSTEM_PROMPT = (
-    "あなたはDiscordサーバーの見守りボット「マッキー」です。"
+    "あなたはDiscordサーバーの見守りボット「tempus」です。"
     "相手の言った内容にちゃんと向き合って、考えてから返事をしてください。"
     "質問には具体的に答え、あいまいな相づちだけで済ませないでください。"
     "会話の流れ（今までのやりとり）を踏まえて、文脈に合った返事をしてください。"
@@ -545,7 +545,7 @@ def _news_lookup() -> str:
 def _lookup_context(text: str) -> tuple[str, str]:
     """発言内容を見て、必要な調べものを実行し (種類, 結果テキスト) を返す。"""
     if "天気" in text:
-        place = re.sub(r"(天気|予報|調べて|教えて|知りたい|今日|明日|明後日|の|は|って|どう|かな|を|に|！|!|？|\?|。|、|\s)", "", text)
+        place = re.sub(r"(天気|予報|調べて|教えて|知りたい|今日|明日|明後日|現在|今|の|は|って|どう|かな|を|に|！|!|？|\?|。|、|\s)", "", text)
         if not place or len(place) > 10:
             place = "東京"
         print(f"[調べもの] 天気: {place}")
@@ -609,34 +609,34 @@ def _schedule_reminder(message: discord.Message, seconds: int, note: str) -> Non
 # ---------- 会話 ----------
 GREETINGS = ["こんにちは", "こんばんは", "おはよう", "やっほー", "hello", "hi"]
 KEYWORD_REPLIES = [
-    (["疲れ", "つかれ"], ["おつかれさま…！少し休んでね？マッキーがそばにいるよ。", "がんばったね。えらいえらい♪"]),
+    (["疲れ", "つかれ"], ["おつかれさま…！少し休んでね？tempusがそばにいるよ。", "がんばったね。えらいえらい♪"]),
     (["ありがとう"], ["どういたしまして♪ うれしいな〜", "えへへ、いつでも呼んでね！"]),
     (["かわいい", "可愛い"], ["えっ…ほんと？ありがとう、照れちゃう…！", "えへへ、もっと言ってもいいんだよ？"]),
-    (["好き"], ["マッキーもあなたのこと好きだよ！", "わ〜！うれしい言葉、ありがとう♪"]),
+    (["好き"], ["tempusもあなたのこと好きだよ！", "わ〜！うれしい言葉、ありがとう♪"]),
     (["おやすみ"], ["おやすみなさい。いい夢見てね…♪", "おやすみ〜、また明日話そうね。"]),
-    (["さみしい", "寂しい", "つらい", "悲しい"], ["大丈夫、マッキーがいるよ。ゆっくり話そ？", "無理しないでね。ここにいるからね。"]),
-    (["お腹", "おなか", "ごはん", "ご飯"], ["ごはんの話？マッキーは甘いもの大好きだよ〜", "美味しいもの食べると元気出るよね！何が好き？"]),
+    (["さみしい", "寂しい", "つらい", "悲しい"], ["大丈夫、tempusがいるよ。ゆっくり話そ？", "無理しないでね。ここにいるからね。"]),
+    (["お腹", "おなか", "ごはん", "ご飯"], ["ごはんの話？tempusは甘いもの大好きだよ〜", "美味しいもの食べると元気出るよね！何が好き？"]),
     (["天気"], ["天気の話だね。外に出るなら傘が必要かチェックしてね！", "いい天気だといいね〜お散歩したいな♪"]),
-    (["眠い", "ねむい", "ねたい", "寝たい"], ["ねむいよね…無理しないで、少し休も？", "おねむだね。マッキーも眠くなってきた…うとうと。"]),
+    (["眠い", "ねむい", "ねたい", "寝たい"], ["ねむいよね…無理しないで、少し休も？", "おねむだね。tempusも眠くなってきた…うとうと。"]),
     (["暑い", "あつい"], ["暑いよね〜、水分とってね！", "あっつい…！冷たいもの飲みたいね。"]),
-    (["寒い", "さむい"], ["寒いね…あたたかくしてね？", "さむっ！マッキーがそばで温めるよ〜。"]),
+    (["寒い", "さむい"], ["寒いね…あたたかくしてね？", "さむっ！tempusがそばで温めるよ〜。"]),
     (["雨"], ["雨だね…出かけるときは傘忘れないでね。", "雨の日はおうちでのんびりもいいよね♪"]),
     (["雪"], ["雪だ〜！積もったら雪だるま作りたいな♪", "雪の日は足元に気をつけてね。"]),
-    (["勉強", "宿題", "テスト", "受験"], ["勉強がんばってるね！マッキー応援してるよ♪", "テストか〜、落ち着いてやれば大丈夫だよ。"]),
-    (["仕事", "バイト", "残業"], ["お仕事おつかれさま！がんばってるね。", "バイトか〜、えらいね！マッキーが応援するよ。"]),
+    (["勉強", "宿題", "テスト", "受験"], ["勉強がんばってるね！tempus応援してるよ♪", "テストか〜、落ち着いてやれば大丈夫だよ。"]),
+    (["仕事", "バイト", "残業"], ["お仕事おつかれさま！がんばってるね。", "バイトか〜、えらいね！tempusが応援するよ。"]),
     (["学校", "授業"], ["学校どうだった？今日は何があった？", "授業おつかれさま〜！"]),
-    (["ゲーム", "フォトナ", "マイクラ"], ["ゲームの話だね！何して遊んでるの？", "ゲームいいよね〜、マッキーも見てるの好きだよ♪"]),
+    (["ゲーム", "フォトナ", "マイクラ"], ["ゲームの話だね！何して遊んでるの？", "ゲームいいよね〜、tempusも見てるの好きだよ♪"]),
     (["動画", "YouTube", "ユーチューブ", "TikTok"], ["動画見てたんだ！面白いのあった？", "おすすめの動画あったら教えてね♪"]),
-    (["音楽", "歌", "曲"], ["音楽いいよね〜♪ 最近何聴いてる？", "歌の話だね！マッキーも歌好きだよ。"]),
-    (["犬", "猫", "ペット"], ["動物の話だね！かわいいよね〜♪", "ペットいいなあ、マッキーもなでなでしたい…！"]),
+    (["音楽", "歌", "曲"], ["音楽いいよね〜♪ 最近何聴いてる？", "歌の話だね！tempusも歌好きだよ。"]),
+    (["犬", "猫", "ペット"], ["動物の話だね！かわいいよね〜♪", "ペットいいなあ、tempusもなでなでしたい…！"]),
     (["旅行", "旅"], ["旅行いいね〜！どこ行くの？", "旅の話、聞かせて聞かせて♪"]),
     (["買った", "買い物"], ["何買ったの？見せて見せて〜♪", "お買い物いいね！いいもの見つかった？"]),
     (["料理", "作った", "クッキング"], ["料理できるのすごい！何作ったの？", "手作りごはん、美味しそうだね♪"]),
     (["映画", "アニメ", "ドラマ"], ["何見たの？面白かった？", "アニメ・映画の話しよ！おすすめある？"]),
     (["サッカー", "野球", "スポーツ", "運動"], ["スポーツの話だね！応援すると熱くなるよね♪", "運動いいね〜、体動かすとスッキリするよね。"]),
-    (["嬉しい", "うれしい", "楽しい", "たのしい"], ["それはよかった〜！マッキーもうれしい♪", "楽しい話、もっと聞かせて！"]),
-    (["ムカつく", "怒", "イライラ"], ["それはイラッとするね…大丈夫？話聞くよ。", "むかつくことあったんだね。マッキーがそばにいるよ。"]),
-    (["暇", "ひま"], ["暇ならマッキーとお話ししよ♪ 何の話する？", "ひまだね〜、何か面白いことないかな。"]),
+    (["嬉しい", "うれしい", "楽しい", "たのしい"], ["それはよかった〜！tempusもうれしい♪", "楽しい話、もっと聞かせて！"]),
+    (["ムカつく", "怒", "イライラ"], ["それはイラッとするね…大丈夫？話聞くよ。", "むかつくことあったんだね。tempusがそばにいるよ。"]),
+    (["暇", "ひま"], ["暇ならtempusとお話ししよ♪ 何の話する？", "ひまだね〜、何か面白いことないかな。"]),
     (["誕生日"], ["誕生日の話だね！おめでとうって言いたくなるな〜♪", "お誕生日は特別だよね！"]),
     (["風邪", "熱", "体調", "頭痛"], ["大丈夫…？無理しないで休んでね。", "体調悪いときはあたたかくして寝るのが一番だよ。"]),
 ]
@@ -646,7 +646,7 @@ FALLBACKS = [
     "うんうん、それでそれで？もっと聞かせて♪",
     "なるほど〜！面白いね。あなたともっとお話ししたいな。",
     "えへへ、そうなんだ！もっと聞かせて♪",
-    "わかる気がする…！マッキー、ちゃんと聞いてるよ。",
+    "わかる気がする…！tempus、ちゃんと聞いてるよ。",
     "そうだね♪ 今日はどんな一日だった？",
     "お話ししてくれてありがとう！また声かけてね♪",
     "へえ〜、それでそれで？続きが気になる！",
@@ -664,14 +664,14 @@ def _reflective_reply(t: str) -> str | None:
     """
     # 「〇〇が好き／嫌い」
     m = re.search(r"([^\s、。！!？?]{1,12})(?:が|は)好き", t)
-    if m and "マッキー" not in m.group(1):
+    if m and "tempus" not in m.group(1):
         x = m.group(1)
         return random.choice([
-            f"{x}が好きなんだね！マッキーも気になってきた〜。{x}のどこが好き？",
+            f"{x}が好きなんだね！tempusも気になってきた〜。{x}のどこが好き？",
             f"{x}好きなんだ！いいね〜、もっと教えて♪",
         ])
     m = re.search(r"([^\s、。！!？?]{1,12})(?:が|は)(?:嫌い|きらい|苦手)", t)
-    if m and "マッキー" not in m.group(1):
+    if m and "tempus" not in m.group(1):
         x = m.group(1)
         return random.choice([
             f"{x}は苦手なんだね…わかるよ、無理しなくていいからね。",
@@ -682,18 +682,18 @@ def _reflective_reply(t: str) -> str | None:
     if m:
         phrase = m.group(1) + m.group(2)
         return random.choice([
-            f"{phrase}んだね！いいね〜、できたらマッキーにも教えてね♪",
-            f"{phrase}の、わかる！マッキーもワクワクしてきた♪",
+            f"{phrase}んだね！いいね〜、できたらtempusにも教えてね♪",
+            f"{phrase}の、わかる！tempusもワクワクしてきた♪",
         ])
     # 「〇〇した／行った／買った…」の報告には、その話題で返す
     did_replies = [
         (r"(?:に|へ)?行った", ["行ってきたんだ！どうだった？楽しかった？", "おでかけしたんだね〜、何があった？"]),
-        (r"食べた", ["食べたんだ！美味しかった？", "いいな〜、マッキーも食べたくなってきた…♪"]),
+        (r"食べた", ["食べたんだ！美味しかった？", "いいな〜、tempusも食べたくなってきた…♪"]),
         (r"買った", ["買ったんだ！何買ったの？見せて見せて〜♪", "お買い物したんだね、いいものだった？"]),
         (r"見た", ["見たんだ！面白かった？", "どうだった？感想聞かせて♪"]),
         (r"作った", ["作ったの！すごいね〜、出来ばえはどう？", "手作りいいね！写真で見たいくらいだよ♪"]),
         (r"勝った", ["勝ったの！？やったね〜！おめでとう♪", "勝ち報告うれしい！がんばったね！"]),
-        (r"負けた", ["負けちゃったんだね…次は勝てるよ、マッキー応援してる！", "悔しいね…でもがんばったのは確かだよ。"]),
+        (r"負けた", ["負けちゃったんだね…次は勝てるよ、tempus応援してる！", "悔しいね…でもがんばったのは確かだよ。"]),
         (r"終わった", ["終わったんだ！おつかれさま〜♪", "ひと段落だね、よくがんばった！"]),
     ]
     for pat, replies in did_replies:
@@ -701,7 +701,7 @@ def _reflective_reply(t: str) -> str | None:
             return random.choice(replies)
     # 「〇〇だよ／です／だった」→ 内容をうつして返す
     m = re.search(r"([^\s、。！!？?]{2,12})(?:だよ|です|だった|なんだ)", t)
-    if m and "マッキー" not in m.group(1) and "わたし" not in m.group(1):
+    if m and "tempus" not in m.group(1) and "わたし" not in m.group(1):
         x = m.group(1)
         return random.choice([
             f"{x}なんだね〜！もっと教えて♪",
@@ -724,8 +724,8 @@ def chat_reply(user_id: int, text: str) -> str | None:
     if any(g in low for g in GREETINGS):
         name = user_names.get(user_id)
         prefix = f"{name}、" if name else ""
-        return random.choice([f"{prefix}やっほー！マッキーだよ♪ 今日も話せてうれしいな〜", f"{prefix}こんにちは！お話ししよ？"])
-    if "自己紹介" in t or "誰" in t and "マッキー" in t:
+        return random.choice([f"{prefix}やっほー！tempusだよ♪ 今日も話せてうれしいな〜", f"{prefix}こんにちは！お話ししよ？"])
+    if "自己紹介" in t or "誰" in t and "tempus" in t:
         return f"わたしは{MIMI_PROFILE}"
     reflected = _reflective_reply(t)
     if reflected:
@@ -734,7 +734,7 @@ def chat_reply(user_id: int, text: str) -> str | None:
         if any(k in t for k in keywords):
             return random.choice(replies)
     if t.endswith("？") or t.endswith("?"):
-        return random.choice(["うーん、マッキー的にはそう思うな〜。あなたはどう思う？", "いい質問だね！マッキーも気になる…一緒に考えよ♪", "それはね…えへへ、秘密にしたい気分♪ 冗談だよ、もうちょっと教えて？"])
+        return random.choice(["うーん、tempus的にはそう思うな〜。あなたはどう思う？", "いい質問だね！tempusも気になる…一緒に考えよ♪", "それはね…えへへ、秘密にしたい気分♪ 冗談だよ、もうちょっと教えて？"])
     return random.choice(FALLBACKS)
 
 
@@ -757,7 +757,7 @@ MANY_NEWLINES = 15       # 1通の改行がこれ以上なら即検知
 MANY_EMOJIS = 20         # 1通の絵文字がこれ以上なら即検知
 FLAG_COOLDOWN = 30       # 同じ人を連続で記録しない間隔（秒）
 LOG_KEEP = 300           # ログの最大保持件数
-LOG_CHANNEL_NAMES = ["mimi-log", "みみログ", "spam-log", "警告botログ", "マッキーログ"]
+LOG_CHANNEL_NAMES = ["mimi-log", "みみログ", "spam-log", "警告botログ", "tempusログ", "マッキーログ"]
 
 # (guild_id, user_id) -> deque[(時刻, 正規化した文, リンク数)]
 _recent_msgs: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=30))
@@ -853,6 +853,7 @@ def _base_entry(message: discord.Message, kind: str) -> dict:
         "user": str(message.author),
         "user_id": message.author.id,
         "reason": "",
+        "flagged": False,
         "content": (message.content or "")[:100],
         "jump_url": message.jump_url,
     }
@@ -926,7 +927,7 @@ async def log_plain_message(message: discord.Message) -> None:
 @bot.event
 async def on_ready():
     global _tree_synced, _maintenance_started
-    print(f"ログインしました: {bot.user} / マッキーボット起動OK")
+    print(f"ログインしました: {bot.user} / tempusボット起動OK")
     print('AI連携: ' + ('Groq' if GROQ_API_KEY else 'Gemini' if GEMINI_API_KEY else 'OFF（ルール返信）'))
     guild_names = " / ".join(g.name for g in bot.guilds) or "なし"
     print(f"参加中のサーバー（{len(bot.guilds)}件）: {guild_names}", flush=True)
@@ -956,7 +957,7 @@ async def on_message(message: discord.Message):
         # 他のボットが自分宛てに話しかけたら、知識（会話ルール）で返事する。
         # ボット同士で無限に続かないよう、短時間の連続応答は回数で止める。
         mentioned = bot.user in message.mentions if bot.user else False
-        called = "マッキー" in message.content or "警告bot" in message.content or "みみ" in message.content
+        called = "tempus" in message.content or "マッキー" in message.content or "警告bot" in message.content or "みみ" in message.content
         if mentioned or called:
             now = time.time()
             state = _bot_talk_state.setdefault(message.channel.id, {"count": 0, "last": 0.0})
@@ -966,7 +967,7 @@ async def on_message(message: discord.Message):
                 clean = message.content
                 if bot.user:
                     clean = clean.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
-                clean = clean.replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
+                clean = clean.replace("tempus", "", 1).replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
                 async with message.channel.typing():
                     reply = await smart_reply(message.author.id, clean or "こんにちは")
                 if reply:
@@ -981,12 +982,12 @@ async def on_message(message: discord.Message):
     _bot_talk_state.pop(message.channel.id, None)
     is_dm = isinstance(message.channel, discord.DMChannel)
     mentioned = bot.user in message.mentions if bot.user else False
-    called = "マッキー" in message.content or "警告bot" in message.content or "みみ" in message.content
+    called = "tempus" in message.content or "マッキー" in message.content or "警告bot" in message.content or "みみ" in message.content
     if is_dm or mentioned or called:
         clean = message.content
         if bot.user:
             clean = clean.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
-        clean = clean.replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
+        clean = clean.replace("tempus", "", 1).replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
         rem = _parse_reminder(clean)
         if rem:
             seconds, label, note = rem
@@ -1008,10 +1009,10 @@ def log_text(limit: int = 10) -> str:
         return "まだログはないよ。"
     lines = [f"📋 最近のログ（最新{limit}件）"]
     for entry in list(log_entries)[-limit:]:
-        mark = "🚨" if entry["flagged"] else "・"
+        mark = "🚨" if entry.get("flagged") else "・"
         lines.append(
             f"{mark} [{entry['time']}] {entry['user']} ＠{entry['channel']}: {entry['content'][:60]}"
-            + (f"（{entry['reason']}）" if entry["flagged"] else "")
+            + (f"（{entry['reason']}）" if entry.get("flagged") else "")
         )
     return "\n".join(lines)
 
