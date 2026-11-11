@@ -17,6 +17,7 @@ Render等のWebサービスで動かす場合:
 コマンドは無し（全部削除済み）。
 会話はメンション、DM、文に「マッキー」を含めると返事するよ。
 他のボットが話しかけてきたら、ボット同士でも会話するよ（無限ループ防止つき）。
+返事はすぐ送らず、「入力中…」を出して少し考えてから送るよ。
 サーバー内では全ての投稿を1通ごとにログに記録するよ。スパムっぽい投稿（連投・同じ文の
 繰り返し・リンク連投・大量メンション・招待リンク・同じ文字や絵文字の連打・改行荒らし・
 指定した監視ワード）は🚨検知つきで記録するよ（消したりBANはしないよ）。
@@ -126,6 +127,25 @@ _bot_talk_state: dict[int, dict] = {}
 
 # ユーザーごとの状態
 user_names: dict[int, str] = {}
+
+
+async def send_thoughtful_reply(message: discord.Message, reply: str, source_text: str = "") -> None:
+    """すぐ返さず、「入力中…」を出して少し考えてから返事する。
+
+    考える時間は返信の長さで変わる（長い返事ほど少し長く考える）。
+    質問っぽい文には、ちょっぴり長めに考える。
+    """
+    think = 1.2 + len(reply) * 0.05 + random.uniform(0, 0.8)
+    if "？" in source_text or "?" in source_text or "なに" in source_text or "何" in source_text or "どう" in source_text:
+        think += 0.8
+    think = min(think, 5.0)
+    try:
+        async with message.channel.typing():
+            await asyncio.sleep(think)
+    except Exception:
+        await asyncio.sleep(min(think, 2.0))
+    await message.channel.send(reply)
+
 
 # ---------- 会話 ----------
 GREETINGS = ["こんにちは", "こんばんは", "おはよう", "やっほー", "hello", "hi"]
@@ -405,7 +425,7 @@ async def on_message(message: discord.Message):
                 clean = clean.replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
                 reply = chat_reply(message.author.id, clean or "こんにちは")
                 if reply:
-                    await message.channel.send(reply)
+                    await send_thoughtful_reply(message, reply, clean)
         return
     # サーバー内では全投稿をログに記録（スパムっぽいものは検知つき）
     if message.guild is not None:
@@ -424,7 +444,7 @@ async def on_message(message: discord.Message):
         clean = clean.replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
         reply = chat_reply(message.author.id, clean or "こんにちは")
         if reply:
-            await message.channel.send(reply)
+            await send_thoughtful_reply(message, reply, clean)
         return
 
 
