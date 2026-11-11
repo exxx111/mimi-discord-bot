@@ -1,5 +1,5 @@
 """
-警告bot Discordボット - かわいい女の子キャラクター風 会話＆じゃんけんボット
+マッキー Discordボット - かわいい女の子キャラクター風 会話＆じゃんけんボット
 
 使い方:
   1. pip install discord.py
@@ -8,7 +8,7 @@
        export DISCORD_TOKEN="あなたのトークン"
      Windows (PowerShell):  $env:DISCORD_TOKEN="あなたのトークン"
   4. python mimi-discord-bot.py
-  5. Bot の招待URLでサーバーに入れて、メンション or DM or 「警告bot」って呼んでね
+  5. Bot の招待URLでサーバーに入れて、メンション or DM or 「マッキー」って呼んでね
 
 Render等のWebサービスで動かす場合:
   環境変数 PORT が設定されていれば、ヘルスチェック用の小さな
@@ -22,11 +22,11 @@ Render等のWebサービスで動かす場合:
   !game / /game         ゲームのリンクを送るよ（!リンク でもOK、「ゲーム」って言っても送るよ）
   !log / /log           ログの最新10件を見る（管理者向け）
   !help_mimi / /help_mimi ヘルプ
-会話はメンション、DM、文に「警告bot」を含めると返事するよ。
+会話はメンション、DM、文に「マッキー」を含めると返事するよ。
 サーバー内では全ての投稿を1通ごとにログに記録するよ。スパムっぽい投稿（連投・同じ文の
 繰り返し・リンク連投・大量メンション・招待リンク・同じ文字や絵文字の連打・改行荒らし・
 指定した監視ワード）は🚨検知つきで記録するよ（消したりBANはしないよ）。
-ログは「mimi-log」「みみログ」「spam-log」「警告botログ」という名前のチャンネルがあればそこにも流すよ。
+ログは「mimi-log」「みみログ」「spam-log」「警告botログ」「マッキーログ」という名前のチャンネルがあればそこにも流すよ。
 """
 
 import os
@@ -44,10 +44,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# ---------- キャラクター設定：警告bot ----------
-MIMI_NAME = "警告bot"
+# ---------- キャラクター設定：マッキー ----------
+MIMI_NAME = "マッキー"
 MIMI_PROFILE = (
-    "サーバーを見守る「警告bot」だよ。"
+    "サーバーを見守る「マッキー」だよ。"
     "スパムや監視ワードを見張って、ログに残したり警告したりするよ。おしゃべりやじゃんけんもできるよ。"
 )
 
@@ -159,20 +159,20 @@ def janken_result_text(user: discord.abc.User, player: str, cpu: str) -> str:
     if result == "win":
         s["win"] += 1
         comment = random.choice([
-            "すごーい！あなたの勝ちだよ…！警告bot、負けちゃった〜",
-            "やるね！警告botの負けだよ。もう一回しよ？",
+            "すごーい！あなたの勝ちだよ…！マッキー、負けちゃった〜",
+            "やるね！マッキーの負けだよ。もう一回しよ？",
         ])
     elif result == "lose":
         s["lose"] += 1
         comment = random.choice([
-            "やった！警告botの勝ちだよ〜♪ 次は負けないからね？",
-            "えへへ、警告bot強いでしょ？リベンジ待ってるよ！",
+            "やった！マッキーの勝ちだよ〜♪ 次は負けないからね？",
+            "えへへ、マッキー強いでしょ？リベンジ待ってるよ！",
         ])
     else:
         s["draw"] += 1
         comment = "あいこだね！気が合うのかも…？もう一回！"
     return (
-        f"{HAND_EMOJI[player]} あなた: **{player}**　vs　{HAND_EMOJI[cpu]} 警告bot: **{cpu}**\n"
+        f"{HAND_EMOJI[player]} あなた: **{player}**　vs　{HAND_EMOJI[cpu]} マッキー: **{cpu}**\n"
         f"{comment}\n"
         f"📊 {user.display_name} の成績: {s['win']}勝 {s['lose']}敗 {s['draw']}分"
     )
@@ -208,13 +208,13 @@ class JankenView(discord.ui.View):
 # ---------- 会話 ----------
 GREETINGS = ["こんにちは", "こんばんは", "おはよう", "やっほー", "hello", "hi"]
 KEYWORD_REPLIES = [
-    (["疲れ", "つかれ"], ["おつかれさま…！少し休んでね？警告botがそばにいるよ。", "がんばったね。えらいえらい♪"]),
+    (["疲れ", "つかれ"], ["おつかれさま…！少し休んでね？マッキーがそばにいるよ。", "がんばったね。えらいえらい♪"]),
     (["ありがとう"], ["どういたしまして♪ うれしいな〜", "えへへ、いつでも呼んでね！"]),
     (["かわいい", "可愛い"], ["えっ…ほんと？ありがとう、照れちゃう…！", "えへへ、もっと言ってもいいんだよ？"]),
-    (["好き"], ["警告botもあなたのこと好きだよ！", "わ〜！うれしい言葉、ありがとう♪"]),
+    (["好き"], ["マッキーもあなたのこと好きだよ！", "わ〜！うれしい言葉、ありがとう♪"]),
     (["おやすみ"], ["おやすみなさい。いい夢見てね…♪", "おやすみ〜、また明日話そうね。"]),
-    (["さみしい", "寂しい", "つらい", "悲しい"], ["大丈夫、警告botがいるよ。ゆっくり話そ？", "無理しないでね。ここにいるからね。"]),
-    (["お腹", "おなか", "ごはん", "ご飯"], ["ごはんの話？警告botは甘いもの大好きだよ〜", "美味しいもの食べると元気出るよね！何が好き？"]),
+    (["さみしい", "寂しい", "つらい", "悲しい"], ["大丈夫、マッキーがいるよ。ゆっくり話そ？", "無理しないでね。ここにいるからね。"]),
+    (["お腹", "おなか", "ごはん", "ご飯"], ["ごはんの話？マッキーは甘いもの大好きだよ〜", "美味しいもの食べると元気出るよね！何が好き？"]),
     (["天気"], ["天気の話だね。外に出るなら傘が必要かチェックしてね！", "いい天気だといいね〜お散歩したいな♪"]),
 ]
 
@@ -222,7 +222,7 @@ FALLBACKS = [
     "うんうん、それでそれで？もっと聞かせて♪",
     "なるほど〜！面白いね。あなたともっとお話ししたいな。",
     "えへへ、そうなんだ！…じゃんけんもしたくなってきたな〜 `!janken` する？",
-    "わかる気がする…！警告bot、ちゃんと聞いてるよ。",
+    "わかる気がする…！マッキー、ちゃんと聞いてるよ。",
     "そうだね♪ 今日はどんな一日だった？",
     "お話ししてくれてありがとう！「じゃんけん」って言うと対決もできるよ✊",
 ]
@@ -242,16 +242,16 @@ def chat_reply(user_id: int, text: str) -> str | None:
     if any(g in low for g in GREETINGS):
         name = user_names.get(user_id)
         prefix = f"{name}、" if name else ""
-        return random.choice([f"{prefix}やっほー！警告botだよ♪ 今日も話せてうれしいな〜", f"{prefix}こんにちは！何して遊ぶ？じゃんけん？お話し？"])
+        return random.choice([f"{prefix}やっほー！マッキーだよ♪ 今日も話せてうれしいな〜", f"{prefix}こんにちは！何して遊ぶ？じゃんけん？お話し？"])
     if "ゲーム" in t or "リンク" in t:
         return game_link_text()
-    if "自己紹介" in t or "誰" in t and "警告bot" in t:
+    if "自己紹介" in t or "誰" in t and "マッキー" in t:
         return f"わたしは{MIMI_PROFILE}\n`!janken` でじゃんけん対決、`!omikuji` でおみくじ、`!game` でゲームのリンクが送れるよ！"
     for keywords, replies in KEYWORD_REPLIES:
         if any(k in t for k in keywords):
             return random.choice(replies)
     if t.endswith("？") or t.endswith("?"):
-        return random.choice(["うーん、警告bot的にはそう思うな〜。あなたはどう思う？", "いい質問だね！警告botも気になる…一緒に考えよ♪", "それはね…えへへ、秘密にしたい気分♪ 冗談だよ、もうちょっと教えて？"])
+        return random.choice(["うーん、マッキー的にはそう思うな〜。あなたはどう思う？", "いい質問だね！マッキーも気になる…一緒に考えよ♪", "それはね…えへへ、秘密にしたい気分♪ 冗談だよ、もうちょっと教えて？"])
     return random.choice(FALLBACKS)
 
 
@@ -274,7 +274,7 @@ MANY_NEWLINES = 15       # 1通の改行がこれ以上なら即検知
 MANY_EMOJIS = 20         # 1通の絵文字がこれ以上なら即検知
 FLAG_COOLDOWN = 30       # 同じ人を連続で記録しない間隔（秒）
 LOG_KEEP = 300           # ログの最大保持件数
-LOG_CHANNEL_NAMES = ["mimi-log", "みみログ", "spam-log", "警告botログ"]
+LOG_CHANNEL_NAMES = ["mimi-log", "みみログ", "spam-log", "警告botログ", "マッキーログ"]
 
 # (guild_id, user_id) -> deque[(時刻, 正規化した文, リンク数)]
 _recent_msgs: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=30))
@@ -443,7 +443,7 @@ async def log_plain_message(message: discord.Message) -> None:
 @bot.event
 async def on_ready():
     global _tree_synced, _maintenance_started
-    print(f"ログインしました: {bot.user} / 警告botボット起動OK")
+    print(f"ログインしました: {bot.user} / マッキーボット起動OK")
     guild_names = " / ".join(g.name for g in bot.guilds) or "なし"
     print(f"参加中のサーバー（{len(bot.guilds)}件）: {guild_names}", flush=True)
     if not _maintenance_started:
@@ -478,7 +478,7 @@ async def on_message(message: discord.Message):
         return
     is_dm = isinstance(message.channel, discord.DMChannel)
     mentioned = bot.user in message.mentions if bot.user else False
-    called = "警告bot" in message.content or "みみ" in message.content
+    called = "マッキー" in message.content or "警告bot" in message.content or "みみ" in message.content
     # 自然文で「ゲーム」と言われたらリンクを送る
     if "ゲーム" in message.content and (is_dm or mentioned or called):
         await message.channel.send(game_link_text())
@@ -494,7 +494,7 @@ async def on_message(message: discord.Message):
         clean = message.content
         if bot.user:
             clean = clean.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
-        clean = clean.replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
+        clean = clean.replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
         reply = chat_reply(message.author.id, clean or "こんにちは")
         if reply:
             await message.channel.send(reply)
@@ -505,7 +505,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="hello")
 async def hello(ctx: commands.Context):
     name = user_names.get(ctx.author.id, ctx.author.display_name)
-    await ctx.send(f"やっほー、{name}！警告botだよ♪ 会話はメンションかDMで、じゃんけんは `!janken` だよ！")
+    await ctx.send(f"やっほー、{name}！マッキーだよ♪ 会話はメンションかDMで、じゃんけんは `!janken` だよ！")
 
 
 @bot.command(name="janken")
@@ -532,7 +532,7 @@ async def game(ctx: commands.Context):
 @bot.command(name="omikuji")
 async def omikuji(ctx: commands.Context):
     result = random.choice(["大吉", "中吉", "小吉", "吉", "末吉", "凶"])
-    comments = {"大吉": "すごーい大吉！今日は最高の一日だよ♪", "凶": "凶…でも大丈夫、警告botが応援してるからね！"}
+    comments = {"大吉": "すごーい大吉！今日は最高の一日だよ♪", "凶": "凶…でも大丈夫、マッキーが応援してるからね！"}
     await ctx.send(f"🎋 {ctx.author.display_name} のおみくじは **{result}**！{comments.get(result, 'いい日になる予感だよ♪')}")
 
 
@@ -575,13 +575,13 @@ async def help_mimi(ctx: commands.Context):
 _tree_synced = False
 
 
-@bot.tree.command(name="hello", description="警告botがあいさつするよ")
+@bot.tree.command(name="hello", description="マッキーがあいさつするよ")
 async def slash_hello(interaction: discord.Interaction):
     name = user_names.get(interaction.user.id, interaction.user.display_name)
-    await interaction.response.send_message(f"やっほー、{name}！警告botだよ♪ 会話はメンションかDMで、じゃんけんは `/janken` だよ！")
+    await interaction.response.send_message(f"やっほー、{name}！マッキーだよ♪ 会話はメンションかDMで、じゃんけんは `/janken` だよ！")
 
 
-@bot.tree.command(name="janken", description="警告botとじゃんけん対決！")
+@bot.tree.command(name="janken", description="マッキーとじゃんけん対決！")
 @app_commands.describe(hand="手を選ぶと即対決。選ばないとボタン対決になるよ")
 @app_commands.choices(hand=[
     app_commands.Choice(name="グー", value="グー"),
@@ -601,7 +601,7 @@ async def slash_janken(interaction: discord.Interaction, hand: str = None):
 @bot.tree.command(name="omikuji", description="今日の運勢をおみくじで占うよ")
 async def slash_omikuji(interaction: discord.Interaction):
     result = random.choice(["大吉", "中吉", "小吉", "吉", "末吉", "凶"])
-    comments = {"大吉": "すごーい大吉！今日は最高の一日だよ♪", "凶": "凶…でも大丈夫、警告botが応援してるからね！"}
+    comments = {"大吉": "すごーい大吉！今日は最高の一日だよ♪", "凶": "凶…でも大丈夫、マッキーが応援してるからね！"}
     await interaction.response.send_message(f"🎋 {interaction.user.display_name} のおみくじは **{result}**！{comments.get(result, 'いい日になる予感だよ♪')}")
 
 
@@ -622,8 +622,8 @@ async def slash_log(interaction: discord.Interaction):
 
 
 HELP_TEXT = (
-    "**警告botの使い方**\n"
-    "💬 会話: DM、メンション、文に「警告bot」を入れて話しかけてね。「名前は〇〇」で名前を覚えるよ\n"
+    "**マッキーの使い方**\n"
+    "💬 会話: DM、メンション、文に「マッキー」を入れて話しかけてね。「名前は〇〇」で名前を覚えるよ\n"
     "✊ `!janken` / `/janken` : じゃんけん対決（ボタン or 手の選択肢、スコア記録あり）\n"
     "🎋 `!omikuji` / `/omikuji` : おみくじ\n"
     "🎮 `!game` / `/game` : ゲームのリンクを送るよ（`!リンク` でもOK、「ゲーム」って言っても送るよ）\n"
@@ -632,7 +632,7 @@ HELP_TEXT = (
 )
 
 
-@bot.tree.command(name="help_mimi", description="警告botの使い方を表示するよ")
+@bot.tree.command(name="help_mimi", description="マッキーの使い方を表示するよ")
 async def slash_help(interaction: discord.Interaction):
     await interaction.response.send_message(HELP_TEXT)
 
