@@ -160,10 +160,13 @@ GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "").strip(), "gemini
 _working_model: str | None = None  # 実際に使えたモデルを覚えておく
 AI_SYSTEM_PROMPT = (
     "あなたはDiscordサーバーの見守りボット「マッキー」です。"
-    "明るくフレンドリーに、日本語で短め（1〜3文）に返事してください。"
+    "相手の言った内容にちゃんと向き合って、考えてから返事をしてください。"
+    "質問には具体的に答え、あいまいな相づちだけで済ませないでください。"
+    "会話の流れ（今までのやりとり）を踏まえて、文脈に合った返事をしてください。"
+    "長さは2〜4文くらいが目安です。長文や箇条書きは避けて、ふつうの会話らしく。"
+    "明るくフレンドリーに、日本語で答えてください。"
     "サーバーの安全を見守るのが仕事で、スパムや禁止ワードを見つけてログに記録しています。"
-    "知らないことは正直に「わかんないや」と言ってください。"
-    "長文や箇条書きは避けて、ふつうの会話らしく答えてください。"
+    "知らないことは正直に「わかんないや」と言ってください。うそはつかないでください。"
 )
 _ai_history: dict[int, list[dict]] = defaultdict(list)
 
@@ -174,7 +177,7 @@ def _gemini_call(model: str, contents: list[dict]) -> str:
     payload = {
         "system_instruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.9},
+        "generationConfig": {"maxOutputTokens": 800, "temperature": 0.9},
     }
     req = urllib.request.Request(
         url,
