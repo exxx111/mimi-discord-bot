@@ -124,7 +124,7 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-# スラッシュコマンドは /log だけ。起動時の sync() で Discord 側の登録を合わせる。
+# スラッシュコマンドは /log と /janken。起動時の sync() で Discord 側の登録を合わせる。
 _tree_synced = False
 # ボット同士の会話: チャンネルごとの連続応答カウント（無限ループ防止）
 BOT_TALK_MAX = 5
@@ -1282,6 +1282,40 @@ async def slash_log(interaction: discord.Interaction):
         await interaction.response.send_message("ログはサーバーの管理者だけが見られるよ。", ephemeral=True)
         return
     await interaction.response.send_message(log_text(), ephemeral=True)
+
+
+
+# ---------- じゃんけん ----------
+_janken_scores: dict[int, dict] = defaultdict(lambda: {"w": 0, "l": 0, "d": 0})
+_JANKEN_EMOJI = {"グー": "✊", "チョキ": "✌️", "パー": "✋"}
+
+
+@bot.tree.command(name="janken", description="tempusとじゃんけん勝負！")
+@app_commands.choices(
+    hand=[
+        app_commands.Choice(name="グー ✊", value="グー"),
+        app_commands.Choice(name="チョキ ✌️", value="チョキ"),
+        app_commands.Choice(name="パー ✋", value="パー"),
+    ]
+)
+async def slash_janken(interaction: discord.Interaction, hand: app_commands.Choice[str]):
+    user_hand = hand.value
+    bot_hand = random.choice(["グー", "チョキ", "パー"])
+    score = _janken_scores[interaction.user.id]
+    if user_hand == bot_hand:
+        result = "あいこ！"
+        score["d"] += 1
+    elif (user_hand, bot_hand) in (("グー", "チョキ"), ("チョキ", "パー"), ("パー", "グー")):
+        result = "あなたの勝ち！🎉"
+        score["w"] += 1
+    else:
+        result = "tempusの勝ち！💪"
+        score["l"] += 1
+    await interaction.response.send_message(
+        f"{_JANKEN_EMOJI[user_hand]} あなた: {user_hand}　vs　{_JANKEN_EMOJI[bot_hand]} tempus: {bot_hand}\n"
+        f"**{result}**（通算: {score['w']}勝 {score['l']}敗 {score['d']}あいこ）"
+    )
+
 
 if __name__ == "__main__":
     token = os.environ.get("DISCORD_TOKEN")
