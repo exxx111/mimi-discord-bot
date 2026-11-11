@@ -23,6 +23,7 @@ Render等のWebサービスで動かす場合:
 繰り返し・リンク連投・大量メンション・招待リンク・同じ文字や絵文字の連打・改行荒らし・
 指定した監視ワード）は🚨検知つきで記録するよ（消したりBANはしないよ）。
 ログは「mimi-log」「みみログ」「spam-log」「警告botログ」「tempusログ」という名前のチャンネルがあればそこにも流すよ。
+🚨検知したログはクラウド（Firestore）にも保存するので、再起動しても消えないよ（起動時に復元して /log や21時のレポートで見返せる）。
 """
 
 import json
@@ -865,6 +866,110 @@ def _base_entry(message: discord.Message, kind: str) -> dict:
 
 
 
+# ---------- 検知ログのクラウド保存（再起動しても消えないように） ----------
+# 🚨検知したエントリだけを、ゲームと同じ Firebase プロジェクトの
+# Firestore「botlogs」コレクションに保存する。起動時に読み戻して
+# log_entries に復元するので、再起動・再デプロイのあとも /log と
+# 21時の監視レポートで見返せる。通常の投稿（📝）は今まで通りメモリ内だけ。
+_FS_PROJECT = "gemuapuri-game"
+_FS_API_KEY = "AIzaSyAEtvt4gfWLcYoGl9f60soqw-NhI3sKRZ4"
+_FS_BASE = (
+    f"https://firestore.googleapis.com/v1/projects/{_FS_PROJECT}"
+    f"/databases/(default)/documents/botlogs?key={_FS_API_KEY}"
+)
+_cloud_log_loaded = False
+
+
+def _fs_str(v) -> dict:
+    return {"stringValue": str(v)}
+
+
+def _save_detection_to_cloud(entry: dict) -> None:
+    """検知エントリを Firestore に保存する（同期処理・失敗しても例外を出さない）。"""
+    try:
+        fields = {
+            "ts": {"integerValue": str(int(entry["time"].timestamp()))},
+            "time_str": _fs_str(entry["time"].strftime("%Y-%m-%d %H:%M:%S")),
+            "guild": _fs_str(entry.get("guild", "")),
+            "channel": _fs_str(entry.get("channel", "")),
+            "user": _fs_str(entry.get("user", "")),
+            "user_id": {"integerValue": str(entry.get("user_id", 0))},
+            "reason": _fs_str(entry.get("reason", "")),
+            "content": _fs_str(entry.get("content", "")),
+            "jump_url": _fs_str(entry.get("jump_url", "")),
+        }
+        req = urllib.request.Request(
+            _FS_BASE,
+            data=json.dumps({"fields": fields}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            resp.read()
+        print(f"[ログ保存] 検知をクラウドに保存しました: {entry.get('reason', '')}", flush=True)
+    except Exception as e:
+        print(f"[ログ保存] クラウド保存に失敗: {e}", flush=True)
+
+
+def _load_detections_from_cloud(limit: int = 100) -> list[dict]:
+    """Firestore から最近の検知を読み戻して log_entries 用の dict のリストにする。"""
+    data = None
+    for url in (
+        _FS_BASE + f"&pageSize={limit}&orderBy=ts%20desc",
+        _FS_BASE + f"&pageSize={limit}",
+    ):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+            break
+        except Exception as e:
+            print(f"[ログ保存] クラウドからの読み戻しに失敗: {e}", flush=True)
+    if not data:
+        return []
+    entries: list[dict] = []
+    for doc in data.get("documents", []):
+        f = doc.get("fields", {})
+
+        def s(name: str) -> str:
+            return f.get(name, {}).get("stringValue", "")
+
+        try:
+            ts = int(f.get("ts", {}).get("integerValue", "0") or 0)
+            when = datetime.fromtimestamp(ts, JST) if ts else datetime.now(JST)
+        except Exception:
+            when = datetime.now(JST)
+        entries.append({
+            "kind": "spam",
+            "time": when,
+            "guild": s("guild"),
+            "channel": s("channel"),
+            "user": s("user"),
+            "user_id": int(f.get("user_id", {}).get("integerValue", "0") or 0),
+            "reason": s("reason"),
+            "flagged": True,
+            "content": s("content"),
+            "jump_url": s("jump_url"),
+        })
+    entries.sort(key=lambda e: e["time"])
+    return entries[-limit:]
+
+
+async def _restore_cloud_log_once() -> None:
+    """起動時に1回だけ、保存済みの検知を log_entries に復元する。"""
+    global _cloud_log_loaded
+    if _cloud_log_loaded:
+        return
+    _cloud_log_loaded = True
+    restored = await asyncio.to_thread(_load_detections_from_cloud)
+    if restored:
+        log_entries.extend(restored)
+        del log_entries[:-LOG_KEEP]
+        print(f"[ログ保存] 過去の検知を{len(restored)}件復元しました", flush=True)
+    else:
+        print("[ログ保存] 復元する過去の検知はありませんでした", flush=True)
+
+
 # ---------- 荒らし・メンバー監視 ----------
 _member_flag_times: dict[tuple[int, int], list[float]] = defaultdict(list)
 _member_channels: dict[tuple[int, int], list] = defaultdict(list)
@@ -945,6 +1050,7 @@ async def check_and_log_spam(message: discord.Message) -> bool:
     log_entries.append(entry)
     del log_entries[:-LOG_KEEP]
     print(f"[検知] {entry['time']:%Y-%m-%d %H:%M:%S} {entry['guild']} #{entry['channel']} {entry['user']}: {reason}", flush=True)
+    asyncio.create_task(asyncio.to_thread(_save_detection_to_cloud, dict(entry)))
 
     await _post_log(
         message.guild,
@@ -1137,6 +1243,7 @@ async def on_ready():
     print('AI連携: ' + ('Groq' if GROQ_API_KEY else 'Gemini' if GEMINI_API_KEY else 'OFF（ルール返信）'))
     guild_names = " / ".join(g.name for g in bot.guilds) or "なし"
     print(f"参加中のサーバー（{len(bot.guilds)}件）: {guild_names}", flush=True)
+    await _restore_cloud_log_once()
     if not _maintenance_started:
         _maintenance_started = True
         asyncio.create_task(_maintenance_loop())
