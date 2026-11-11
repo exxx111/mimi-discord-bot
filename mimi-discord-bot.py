@@ -121,6 +121,7 @@ async def _maintenance_loop() -> None:
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 # スラッシュコマンドは /log だけ。起動時の sync() で Discord 側の登録を合わせる。
@@ -799,6 +800,10 @@ def _detect_spam(message: discord.Message) -> str | None:
     for e in WATCH_EMOJIS:
         if e in content:
             return f"監視絵文字「{e}」を検知"
+    created = getattr(message.author, "created_at", None)
+    if created is not None and url_count > 0:
+        if datetime.now(timezone.utc) - created < timedelta(hours=24):
+            return "作られて24時間以内のアカウントによるリンク投稿"
     if _INVITE_RE.search(content):
         return "Discord招待リンクの投稿"
     if url_count >= MANY_LINKS_IN_ONE:
@@ -859,12 +864,72 @@ def _base_entry(message: discord.Message, kind: str) -> dict:
     }
 
 
+
+# ---------- 荒らし・メンバー監視 ----------
+_member_flag_times: dict[tuple[int, int], list[float]] = defaultdict(list)
+_member_channels: dict[tuple[int, int], list] = defaultdict(list)
+_member_alerted: dict[tuple[int, int], float] = {}
+_join_times: dict[int, list[float]] = defaultdict(list)
+_join_alerted: dict[int, float] = {}
+
+
+async def _alert_owner_dm(text: str) -> None:
+    """通知先（覚えた管理者＋各サーバーのオーナー）に即時DMする。"""
+    targets: set[int] = set()
+    if _report_user_id:
+        targets.add(_report_user_id)
+    for g in bot.guilds:
+        if g.owner_id:
+            targets.add(g.owner_id)
+    for uid in targets:
+        try:
+            user = bot.get_user(uid) or await bot.fetch_user(uid)
+            dm = await user.create_dm()
+            await dm.send(text)
+        except Exception as e:
+            print(f"[荒らし監視] DM送信に失敗 ({uid}): {e}", flush=True)
+
+
+def _detect_cross_channel(message: discord.Message) -> str | None:
+    """同じ文を短時間に複数チャンネルへ投稿する荒らしパターンの検知。"""
+    content = _normalize(message.content or "")
+    if len(content) < 10 or message.guild is None:
+        return None
+    key = (message.guild.id, message.author.id)
+    now = time.time()
+    hist = [x for x in _member_channels[key] if now - x[0] <= 120]
+    channels = {x[1] for x in hist if x[2] == content} | {message.channel.id}
+    hist.append((now, message.channel.id, content))
+    _member_channels[key] = hist[-50:]
+    if len(channels) >= 3:
+        return "同じ文を複数チャンネルに連続投稿（荒らしの疑い）"
+    return None
+
+
+async def _watch_member(message: discord.Message, reason: str) -> None:
+    """検知のたびにメンバーごとの検知回数を数え、繰り返す人は即時DMで知らせる。"""
+    key = (message.guild.id, message.author.id)
+    now = time.time()
+    times = [t for t in _member_flag_times[key] if now - t <= 600]
+    times.append(now)
+    _member_flag_times[key] = times
+    if len(times) >= 3 and now - _member_alerted.get(key, 0) >= 1800:
+        _member_alerted[key] = now
+        print(f"[荒らし監視] 繰り返し検知で即時通知: {message.author} ({len(times)}回)", flush=True)
+        await _alert_owner_dm(
+            "🚨 荒らしの疑いが強いメンバーがいます\n"
+            f"・ユーザー: {message.author}（{message.guild.name}）\n"
+            f"・10分以内に{len(times)}回検知（最新: {reason}）\n"
+            f"・チャンネル: #{getattr(message.channel, 'name', '')}"
+        )
+
+
 async def check_and_log_spam(message: discord.Message) -> bool:
     """スパムっぽければログに残す。検知したら True（管理者も含め全員対象）。
     ログ用チャンネルがあればそこにも流す。"""
     if message.guild is None:
         return False
-    reason = _detect_spam(message)
+    reason = _detect_cross_channel(message) or _detect_spam(message)
     if not reason:
         return False
     key = (message.guild.id, message.author.id)
@@ -875,6 +940,8 @@ async def check_and_log_spam(message: discord.Message) -> bool:
 
     entry = _base_entry(message, "spam")
     entry["reason"] = reason
+    entry["flagged"] = True
+    await _watch_member(message, reason)
     log_entries.append(entry)
     del log_entries[:-LOG_KEEP]
     print(f"[検知] {entry['time']:%Y-%m-%d %H:%M:%S} {entry['guild']} #{entry['channel']} {entry['user']}: {reason}", flush=True)
@@ -1087,6 +1154,42 @@ async def on_ready():
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     print(f"サーバーに参加しました: {guild.name}", flush=True)
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """参加を監視：作りたてアカウントと、短時間の大量参加（レイド）を即時通知。"""
+    now = time.time()
+    times = [t for t in _join_times[member.guild.id] if now - t <= 600]
+    times.append(now)
+    _join_times[member.guild.id] = times
+    suspicious = False
+    if member.created_at is not None:
+        suspicious = datetime.now(timezone.utc) - member.created_at < timedelta(hours=1)
+    print(
+        f"[参加監視] {member} が {member.guild.name} に参加"
+        + ("（作られて1時間以内のアカウント）" if suspicious else "")
+        + f" / 10分で{len(times)}人目",
+        flush=True,
+    )
+    await _post_log(
+        member.guild,
+        f"👋 **参加** {member}" + ("（⚠️ 作られて1時間以内のアカウント）" if suspicious else ""),
+    )
+    if suspicious:
+        await _alert_owner_dm(
+            "🚨 作りたてアカウントが参加しました\n"
+            f"・ユーザー: {member}（{member.guild.name}）\n"
+            f"・アカウント作成: {member.created_at:%Y-%m-%d %H:%M}"
+        )
+    if len(times) >= 5 and now - _join_alerted.get(member.guild.id, 0) >= 1800:
+        _join_alerted[member.guild.id] = now
+        print(f"[参加監視] 大量参加で即時通知: {member.guild.name} (10分で{len(times)}人)", flush=True)
+        await _alert_owner_dm(
+            "🚨 短時間に大量の参加があります（レイドの疑い）\n"
+            f"・サーバー: {member.guild.name}\n"
+            f"・10分で{len(times)}人が参加"
+        )
 
 
 @bot.event
