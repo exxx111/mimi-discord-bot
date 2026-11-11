@@ -309,11 +309,9 @@ def _detect_spam(message: discord.Message) -> str | None:
 
 
 async def check_and_log_spam(message: discord.Message) -> None:
-    """検知したらログに残し、ログ用チャンネルがあればそこにも流す。"""
+    """検知したらログに残し、ログ用チャンネルがあればそこにも流す。
+    管理者も含めて全員が対象（ボット自身は除く）。"""
     if message.guild is None:
-        return
-    # メッセージ管理権限のある人（モデレーター等）は対象外
-    if isinstance(message.author, discord.Member) and message.author.guild_permissions.manage_messages:
         return
     reason = _detect_spam(message)
     if not reason:
