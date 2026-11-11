@@ -157,7 +157,43 @@ async def send_thoughtful_reply(message: discord.Message, reply: str, source_tex
 # ダメなら GEMINI_API_KEY の Gemini、それも無ければルール返信に切り替える。
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+# Groqで使いたいモデルの優先順（実際はAPIの一覧と照合して使えるものだけ使う）
+GROQ_PREFERRED = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "qwen/qwen3-32b",
+    "openai/gpt-oss-20b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+]
+_groq_models_cache: list[str] | None = None
+
+
+def _groq_models() -> list[str]:
+    """このキーで使えるGroqモデルの一覧をAPIから取得し、優先順に並べる（結果は保持）。"""
+    global _groq_models_cache
+    if _groq_models_cache:
+        return _groq_models_cache
+    try:
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        available = [item.get("id", "") for item in data.get("data", [])]
+        skip = ("whisper", "tts", "guard", "orpheus", "compound")
+        chat_models = [m for m in available if m and not any(k in m for k in skip)]
+        ordered = [m for m in GROQ_PREFERRED if m in chat_models] + [m for m in chat_models if m not in GROQ_PREFERRED]
+        if ordered:
+            _groq_models_cache = ordered
+            print(f"[AI] Groqで使えるモデル: {', '.join(ordered[:4])}")
+            return ordered
+    except Exception as e:
+        print(f"[AI] Groqのモデル一覧の取得に失敗: {e}")
+    return GROQ_PREFERRED
 GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "").strip(), "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-flash-latest"] if m]
 _working_gemini_model: str | None = None
 AI_SYSTEM_PROMPT = (
@@ -198,7 +234,7 @@ def _groq_generate(history: list[tuple[str, str]], text: str) -> str:
     last_err: Exception | None = None
     detail = ""
     while time.monotonic() < deadline:
-        for model in GROQ_MODELS:
+        for model in _groq_models():
             try:
                 reply = _groq_call(model, messages, timeout=20)
                 print(f"[AI] 使用モデル: Groq {model}")
@@ -259,9 +295,9 @@ def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
 
 
 def _gemini_generate(contents: list[dict]) -> str:
-    """Geminiを呼ぶ。混雑時はモデルを替えながら最大約90秒粘る。"""
+    """Geminiを呼ぶ。混雑時はモデルを替えながら最大約45秒粘る。"""
     global _working_gemini_model
-    deadline = time.monotonic() + 90
+    deadline = time.monotonic() + 45
     last_err: Exception | None = None
     while time.monotonic() < deadline:
         candidates = ([_working_gemini_model] if _working_gemini_model else []) + [m for m in GEMINI_MODELS if m != _working_gemini_model]
