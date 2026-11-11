@@ -103,7 +103,7 @@ _maintenance_started = False
 def _self_ping() -> None:
     try:
         req = urllib.request.Request(SELF_URL, headers={"User-Agent": "mimi-keepalive"})
-        with urllib.request.urlopen(req, timeout=30) as res:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
             res.read()
     except Exception:
         pass
@@ -171,7 +171,7 @@ AI_SYSTEM_PROMPT = (
 _ai_history: dict[int, list[dict]] = defaultdict(list)
 
 
-def _gemini_call(model: str, contents: list[dict]) -> str:
+def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
     """指定モデルでGemini APIを1回呼ぶ。"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {
@@ -192,28 +192,35 @@ def _gemini_call(model: str, contents: list[dict]) -> str:
 
 
 def _gemini_generate(contents: list[dict]) -> str:
-    """使えるモデルを探しながらGeminiを呼ぶ（同期処理なので to_thread から使う）。
+    """Geminiを呼ぶ（同期処理なので to_thread から使う）。
 
-    モデル名が変わって404になるときがあるので、候補を順に試し、
-    使えたモデルを覚えて次回からそれを使う。
+    混雑（503など）はGoogle側の一時的なものなので、あきらめずに
+    モデルを替えながら最大約90秒粘る。当たったモデルを覚えて次回から優先する。
     """
     global _working_model
-    candidates = ([_working_model] if _working_model else []) + [m for m in GEMINI_MODELS if m != _working_model]
+    deadline = time.monotonic() + 90
     last_err: Exception | None = None
-    for model in candidates:
-        try:
-            text = _gemini_call(model, contents)
-            if _working_model != model:
-                _working_model = model
-                print(f"[AI] 使用モデル: {model}")
-            return text
-        except urllib.error.HTTPError as e:
-            last_err = e
-            if e.code not in (400, 404, 429, 503):
-                raise
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            # 混雑・タイムアウトのときは次の候補モデルで試す
-            last_err = e
+    while time.monotonic() < deadline:
+        candidates = ([_working_model] if _working_model else []) + [m for m in GEMINI_MODELS if m != _working_model]
+        for model in candidates:
+            remaining = deadline - time.monotonic()
+            if remaining <= 3:
+                break
+            try:
+                text = _gemini_call(model, contents, timeout=min(20.0, remaining))
+                if _working_model != model:
+                    _working_model = model
+                    print(f"[AI] 使用モデル: {model}")
+                return text
+            except urllib.error.HTTPError as e:
+                last_err = e
+                if e.code not in (400, 404, 429, 503):
+                    raise
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last_err = e
+        # 候補を一巡してダメなら、少し待って混雑が解けるのを待つ
+        if time.monotonic() + 6 < deadline:
+            time.sleep(6)
     assert last_err is not None
     raise last_err
 
