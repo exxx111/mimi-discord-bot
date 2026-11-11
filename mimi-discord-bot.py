@@ -1,5 +1,5 @@
 """
-マッキー Discordボット - かわいい女の子キャラクター風 会話＆じゃんけんボット
+マッキー Discordボット - かわいい女の子キャラクター風 会話＆見守りボット
 
 使い方:
   1. pip install discord.py
@@ -14,15 +14,9 @@ Render等のWebサービスで動かす場合:
   環境変数 PORT が設定されていれば、ヘルスチェック用の小さな
   HTTPサーバーが別スレッドで自動起動します。ローカルでは不要です。
 
-コマンド（!版と /スラッシュ版の両方があるよ）:
-  !hello / /hello       あいさつ
-  !janken / /janken     ボタンでじゃんけん対決（スコア付き）
-  !janken グー          文字でも出せるよ（グー / チョキ / パー）。/janken は手の選択肢つき
-  !omikuji / /omikuji   おみくじ
-  !game / /game         ゲームのリンクを送るよ（!リンク でもOK、「ゲーム」って言っても送るよ）
-  !log / /log           ログの最新10件を見る（管理者向け）
-  !help_mimi / /help_mimi ヘルプ
+コマンドは無し（全部削除済み）。
 会話はメンション、DM、文に「マッキー」を含めると返事するよ。
+他のボットが話しかけてきたら、ボット同士でも会話するよ（無限ループ防止つき）。
 サーバー内では全ての投稿を1通ごとにログに記録するよ。スパムっぽい投稿（連投・同じ文の
 繰り返し・リンク連投・大量メンション・招待リンク・同じ文字や絵文字の連打・改行荒らし・
 指定した監視ワード）は🚨検知つきで記録するよ（消したりBANはしないよ）。
@@ -41,26 +35,14 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 # ---------- キャラクター設定：マッキー ----------
 MIMI_NAME = "マッキー"
 MIMI_PROFILE = (
     "サーバーを見守る「マッキー」だよ。"
-    "スパムや監視ワードを見張って、ログに残したり警告したりするよ。おしゃべりやじゃんけんもできるよ。"
+    "スパムや監視ワードを見張って、ログに残したり警告したりするよ。おしゃべりもできるよ。"
 )
-
-# ゲーム（コインタップゲーム）のリンク
-GAME_URL = "https://muse.ai/s/gemuapuri-3-uxe6wxnxtar4xzq/i5K212IGw5Ftctt8OsuXYCA4MOFnxbk831koPjh_F18"
-
-
-def game_link_text() -> str:
-    return (
-        "えへへ、ゲームのリンクだよ♪ みんなで遊んでね！\n"
-        f"🎮 ゲームはこちら → {GAME_URL}"
-    )
-
 
 # ---------- keep-alive（Render等のWebサービス用） ----------
 # 環境変数 PORT が設定されているときだけ、小さなHTTPサーバーを
@@ -136,74 +118,14 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+# スラッシュコマンドは全削除済み。起動時の sync() で Discord 側の登録も消す。
+_tree_synced = False
+# ボット同士の会話: チャンネルごとの連続応答カウント（無限ループ防止）
+BOT_TALK_MAX = 5
+_bot_talk_state: dict[int, dict] = {}
 
 # ユーザーごとの状態
-janken_score = defaultdict(lambda: {"win": 0, "lose": 0, "draw": 0})
 user_names: dict[int, str] = {}
-
-HANDS = ["グー", "チョキ", "パー"]
-# 何に勝つか: グー>チョキ, チョキ>パー, パー>グー
-BEATS = {"グー": "チョキ", "チョキ": "パー", "パー": "グー"}
-HAND_EMOJI = {"グー": "✊", "チョキ": "✌️", "パー": "🖐️"}
-
-
-def judge(player: str, cpu: str) -> str:
-    if player == cpu:
-        return "draw"
-    return "win" if BEATS[player] == cpu else "lose"
-
-
-def janken_result_text(user: discord.abc.User, player: str, cpu: str) -> str:
-    result = judge(player, cpu)
-    s = janken_score[user.id]
-    if result == "win":
-        s["win"] += 1
-        comment = random.choice([
-            "すごーい！あなたの勝ちだよ…！マッキー、負けちゃった〜",
-            "やるね！マッキーの負けだよ。もう一回しよ？",
-        ])
-    elif result == "lose":
-        s["lose"] += 1
-        comment = random.choice([
-            "やった！マッキーの勝ちだよ〜♪ 次は負けないからね？",
-            "えへへ、マッキー強いでしょ？リベンジ待ってるよ！",
-        ])
-    else:
-        s["draw"] += 1
-        comment = "あいこだね！気が合うのかも…？もう一回！"
-    return (
-        f"{HAND_EMOJI[player]} あなた: **{player}**　vs　{HAND_EMOJI[cpu]} マッキー: **{cpu}**\n"
-        f"{comment}\n"
-        f"📊 {user.display_name} の成績: {s['win']}勝 {s['lose']}敗 {s['draw']}分"
-    )
-
-
-class JankenView(discord.ui.View):
-    def __init__(self, author: discord.abc.User):
-        super().__init__(timeout=60)
-        self.author = author
-
-    async def _play(self, interaction: discord.Interaction, hand: str):
-        if interaction.user.id != self.author.id:
-            await interaction.response.send_message("これは他の人の対決だよ。`!janken` で自分のを始めてね！", ephemeral=True)
-            return
-        cpu = random.choice(HANDS)
-        text = janken_result_text(interaction.user, hand, cpu)
-        # ボタンを残して何度でも対決できるようにする
-        await interaction.response.edit_message(content=text, view=self)
-
-    @discord.ui.button(label="グー", emoji="✊", style=discord.ButtonStyle.primary)
-    async def rock(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._play(interaction, "グー")
-
-    @discord.ui.button(label="チョキ", emoji="✌️", style=discord.ButtonStyle.success)
-    async def scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._play(interaction, "チョキ")
-
-    @discord.ui.button(label="パー", emoji="🖐️", style=discord.ButtonStyle.danger)
-    async def paper(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._play(interaction, "パー")
-
 
 # ---------- 会話 ----------
 GREETINGS = ["こんにちは", "こんばんは", "おはよう", "やっほー", "hello", "hi"]
@@ -221,10 +143,10 @@ KEYWORD_REPLIES = [
 FALLBACKS = [
     "うんうん、それでそれで？もっと聞かせて♪",
     "なるほど〜！面白いね。あなたともっとお話ししたいな。",
-    "えへへ、そうなんだ！…じゃんけんもしたくなってきたな〜 `!janken` する？",
+    "えへへ、そうなんだ！もっと聞かせて♪",
     "わかる気がする…！マッキー、ちゃんと聞いてるよ。",
     "そうだね♪ 今日はどんな一日だった？",
-    "お話ししてくれてありがとう！「じゃんけん」って言うと対決もできるよ✊",
+    "お話ししてくれてありがとう！また声かけてね♪",
 ]
 
 
@@ -242,11 +164,9 @@ def chat_reply(user_id: int, text: str) -> str | None:
     if any(g in low for g in GREETINGS):
         name = user_names.get(user_id)
         prefix = f"{name}、" if name else ""
-        return random.choice([f"{prefix}やっほー！マッキーだよ♪ 今日も話せてうれしいな〜", f"{prefix}こんにちは！何して遊ぶ？じゃんけん？お話し？"])
-    if "ゲーム" in t or "リンク" in t:
-        return game_link_text()
+        return random.choice([f"{prefix}やっほー！マッキーだよ♪ 今日も話せてうれしいな〜", f"{prefix}こんにちは！お話ししよ？"])
     if "自己紹介" in t or "誰" in t and "マッキー" in t:
-        return f"わたしは{MIMI_PROFILE}\n`!janken` でじゃんけん対決、`!omikuji` でおみくじ、`!game` でゲームのリンクが送れるよ！"
+        return f"わたしは{MIMI_PROFILE}"
     for keywords, replies in KEYWORD_REPLIES:
         if any(k in t for k in keywords):
             return random.choice(replies)
@@ -465,31 +385,38 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.event
 async def on_message(message: discord.Message):
+    # 自分自身の投稿は無視
+    if bot.user and message.author.id == bot.user.id:
+        return
     if message.author.bot:
+        # 他のボットが自分宛てに話しかけたら、知識（会話ルール）で返事する。
+        # ボット同士で無限に続かないよう、短時間の連続応答は回数で止める。
+        mentioned = bot.user in message.mentions if bot.user else False
+        called = "マッキー" in message.content or "警告bot" in message.content or "みみ" in message.content
+        if mentioned or called:
+            now = time.time()
+            state = _bot_talk_state.setdefault(message.channel.id, {"count": 0, "last": 0.0})
+            state["count"] = state["count"] + 1 if now - state["last"] < 60 else 1
+            state["last"] = now
+            if state["count"] <= BOT_TALK_MAX:
+                clean = message.content
+                if bot.user:
+                    clean = clean.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
+                clean = clean.replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
+                reply = chat_reply(message.author.id, clean or "こんにちは")
+                if reply:
+                    await message.channel.send(reply)
         return
     # サーバー内では全投稿をログに記録（スパムっぽいものは検知つき）
     if message.guild is not None:
         detected = await check_and_log_spam(message)
         if not detected:
             await log_plain_message(message)
-    # コマンドは先に処理
-    if message.content.startswith("!"):
-        await bot.process_commands(message)
-        return
+    # 人が話したら、ボット同士の連続カウントはリセット
+    _bot_talk_state.pop(message.channel.id, None)
     is_dm = isinstance(message.channel, discord.DMChannel)
     mentioned = bot.user in message.mentions if bot.user else False
     called = "マッキー" in message.content or "警告bot" in message.content or "みみ" in message.content
-    # 自然文で「ゲーム」と言われたらリンクを送る
-    if "ゲーム" in message.content and (is_dm or mentioned or called):
-        await message.channel.send(game_link_text())
-        return
-    # 自然文でじゃんけん開始
-    if ("じゃんけん" in message.content or "ジャンケン" in message.content) and (is_dm or mentioned or called):
-        await message.channel.send(
-            f"じゃんけん対決だね！{message.author.display_name}、手を選んで♪\n最初はグー…じゃんけん・ぽん！",
-            view=JankenView(message.author),
-        )
-        return
     if is_dm or mentioned or called:
         clean = message.content
         if bot.user:
@@ -499,142 +426,6 @@ async def on_message(message: discord.Message):
         if reply:
             await message.channel.send(reply)
         return
-    await bot.process_commands(message)
-
-
-@bot.command(name="hello")
-async def hello(ctx: commands.Context):
-    name = user_names.get(ctx.author.id, ctx.author.display_name)
-    await ctx.send(f"やっほー、{name}！マッキーだよ♪ 会話はメンションかDMで、じゃんけんは `!janken` だよ！")
-
-
-@bot.command(name="janken")
-async def janken(ctx: commands.Context, hand: str = None):
-    """!janken → ボタン対決 / !janken グー → 即対決"""
-    if hand is None:
-        await ctx.send(f"{ctx.author.display_name} とじゃんけん対決！手を選んでね♪\n最初はグー…じゃんけん・ぽん！", view=JankenView(ctx.author))
-        return
-    hand = hand.strip()
-    aliases = {"ぐー": "グー", "ちょき": "チョキ", "ぱー": "パー", "rock": "グー", "scissors": "チョキ", "paper": "パー"}
-    hand = aliases.get(hand.lower(), hand)
-    if hand not in HANDS:
-        await ctx.send("手は **グー / チョキ / パー** のどれかで出してね！例: `!janken グー`")
-        return
-    await ctx.send(janken_result_text(ctx.author, hand, random.choice(HANDS)))
-
-
-@bot.command(name="game", aliases=["リンク", "link", "げーむ"])
-async def game(ctx: commands.Context):
-    """!game / !リンク → ゲームのリンクを送る"""
-    await ctx.send(game_link_text())
-
-
-@bot.command(name="omikuji")
-async def omikuji(ctx: commands.Context):
-    result = random.choice(["大吉", "中吉", "小吉", "吉", "末吉", "凶"])
-    comments = {"大吉": "すごーい大吉！今日は最高の一日だよ♪", "凶": "凶…でも大丈夫、マッキーが応援してるからね！"}
-    await ctx.send(f"🎋 {ctx.author.display_name} のおみくじは **{result}**！{comments.get(result, 'いい日になる予感だよ♪')}")
-
-
-def log_text(guild_name: str) -> str:
-    """ログの表示テキスト（!版と /版で共用）。"""
-    entries = [e for e in log_entries if e["guild"] == guild_name][-10:]
-    if not entries:
-        return "📋 ログはまだありません。"
-    lines = ["📋 **ログ（最新10件）**"]
-    for e in reversed(entries):
-        if e.get("kind") == "spam":
-            lines.append(
-                f"・🚨 {e['time']:%m/%d %H:%M} {e['user']}（#{e['channel']}）: {e['reason']}\n"
-                f"　内容: {e['content']}"
-            )
-        else:
-            lines.append(f"・{e['time']:%m/%d %H:%M} {e['user']}（#{e['channel']}）: {e['content']}")
-    return "\n".join(lines)
-
-
-@bot.command(name="log")
-async def log_cmd(ctx: commands.Context):
-    """!log : ログの最新10件（メッセージ管理権限のある人だけ）"""
-    if ctx.guild is None:
-        await ctx.send("ログはサーバーの中で見てね。")
-        return
-    if not (isinstance(ctx.author, discord.Member) and ctx.author.guild_permissions.manage_messages):
-        await ctx.send("ログはサーバーの管理者だけが見られるよ。")
-        return
-    await ctx.send(log_text(ctx.guild.name))
-
-
-@bot.command(name="help_mimi")
-async def help_mimi(ctx: commands.Context):
-    await ctx.send(HELP_TEXT)
-
-
-# ---------- スラッシュコマンド（/ で出てくる版） ----------
-# 起動時に bot.tree.sync() で Discord に登録される。
-_tree_synced = False
-
-
-@bot.tree.command(name="hello", description="マッキーがあいさつするよ")
-async def slash_hello(interaction: discord.Interaction):
-    name = user_names.get(interaction.user.id, interaction.user.display_name)
-    await interaction.response.send_message(f"やっほー、{name}！マッキーだよ♪ 会話はメンションかDMで、じゃんけんは `/janken` だよ！")
-
-
-@bot.tree.command(name="janken", description="マッキーとじゃんけん対決！")
-@app_commands.describe(hand="手を選ぶと即対決。選ばないとボタン対決になるよ")
-@app_commands.choices(hand=[
-    app_commands.Choice(name="グー", value="グー"),
-    app_commands.Choice(name="チョキ", value="チョキ"),
-    app_commands.Choice(name="パー", value="パー"),
-])
-async def slash_janken(interaction: discord.Interaction, hand: str = None):
-    if hand is None:
-        await interaction.response.send_message(
-            f"{interaction.user.display_name} とじゃんけん対決！手を選んでね♪\n最初はグー…じゃんけん・ぽん！",
-            view=JankenView(interaction.user),
-        )
-        return
-    await interaction.response.send_message(janken_result_text(interaction.user, hand, random.choice(HANDS)))
-
-
-@bot.tree.command(name="omikuji", description="今日の運勢をおみくじで占うよ")
-async def slash_omikuji(interaction: discord.Interaction):
-    result = random.choice(["大吉", "中吉", "小吉", "吉", "末吉", "凶"])
-    comments = {"大吉": "すごーい大吉！今日は最高の一日だよ♪", "凶": "凶…でも大丈夫、マッキーが応援してるからね！"}
-    await interaction.response.send_message(f"🎋 {interaction.user.display_name} のおみくじは **{result}**！{comments.get(result, 'いい日になる予感だよ♪')}")
-
-
-@bot.tree.command(name="game", description="コインタップゲームのリンクを送るよ")
-async def slash_game(interaction: discord.Interaction):
-    await interaction.response.send_message(game_link_text())
-
-
-@bot.tree.command(name="log", description="ログの最新10件を見る（管理者向け）")
-async def slash_log(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("ログはサーバーの中で見てね。", ephemeral=True)
-        return
-    if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_messages):
-        await interaction.response.send_message("ログはサーバーの管理者だけが見られるよ。", ephemeral=True)
-        return
-    await interaction.response.send_message(log_text(interaction.guild.name), ephemeral=True)
-
-
-HELP_TEXT = (
-    "**マッキーの使い方**\n"
-    "💬 会話: DM、メンション、文に「マッキー」を入れて話しかけてね。「名前は〇〇」で名前を覚えるよ\n"
-    "✊ `!janken` / `/janken` : じゃんけん対決（ボタン or 手の選択肢、スコア記録あり）\n"
-    "🎋 `!omikuji` / `/omikuji` : おみくじ\n"
-    "🎮 `!game` / `/game` : ゲームのリンクを送るよ（`!リンク` でもOK、「ゲーム」って言っても送るよ）\n"
-    "📝 ログ: サーバーの投稿は1通ごとに全部ログに記録してるよ（スパムっぽいものは🚨検知つき、監視ワードを見たらその場で警告もするよ）。管理者は `!log` / `/log` で確認\n"
-    "👋 `!hello` / `/hello` : あいさつ"
-)
-
-
-@bot.tree.command(name="help_mimi", description="マッキーの使い方を表示するよ")
-async def slash_help(interaction: discord.Interaction):
-    await interaction.response.send_message(HELP_TEXT)
 
 
 if __name__ == "__main__":
