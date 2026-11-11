@@ -444,6 +444,8 @@ async def log_plain_message(message: discord.Message) -> None:
 async def on_ready():
     global _tree_synced, _maintenance_started
     print(f"ログインしました: {bot.user} / 警告botボット起動OK")
+    guild_names = " / ".join(g.name for g in bot.guilds) or "なし"
+    print(f"参加中のサーバー（{len(bot.guilds)}件）: {guild_names}", flush=True)
     if not _maintenance_started:
         _maintenance_started = True
         asyncio.create_task(_maintenance_loop())
@@ -454,6 +456,11 @@ async def on_ready():
             print(f"スラッシュコマンドを同期しました: {len(synced)}件")
         except Exception as e:
             print(f"スラッシュコマンドの同期に失敗: {e}")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    print(f"サーバーに参加しました: {guild.name}", flush=True)
 
 
 @bot.event
