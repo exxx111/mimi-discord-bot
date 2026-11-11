@@ -103,7 +103,7 @@ _maintenance_started = False
 def _self_ping() -> None:
     try:
         req = urllib.request.Request(SELF_URL, headers={"User-Agent": "mimi-keepalive"})
-        with urllib.request.urlopen(req, timeout=timeout) as res:
+        with urllib.request.urlopen(req, timeout=10) as res:
             res.read()
     except Exception:
         pass
@@ -185,7 +185,7 @@ def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
         headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.load(resp)
     parts = data["candidates"][0]["content"]["parts"]
     return "".join(part.get("text", "") for part in parts).strip()
