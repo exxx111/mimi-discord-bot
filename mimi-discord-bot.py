@@ -180,7 +180,7 @@ def _groq_call(model: str, messages: list[dict], timeout: float = 20) -> str:
     req = urllib.request.Request(
         "https://api.groq.com/openai/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"},
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}", "User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)", "Accept": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -196,6 +196,7 @@ def _groq_generate(history: list[tuple[str, str]], text: str) -> str:
     messages.append({"role": "user", "content": text})
     deadline = time.monotonic() + 60
     last_err: Exception | None = None
+    detail = ""
     while time.monotonic() < deadline:
         for model in GROQ_MODELS:
             try:
@@ -204,14 +205,18 @@ def _groq_generate(history: list[tuple[str, str]], text: str) -> str:
                 return reply
             except urllib.error.HTTPError as e:
                 last_err = e
-                if e.code not in (400, 404, 429, 503):
+                try:
+                    detail = e.read().decode("utf-8", "ignore")[:200]
+                except Exception:
+                    pass
+                if e.code not in (400, 403, 404, 429, 503):
                     raise
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = e
         if time.monotonic() + 4 < deadline:
             time.sleep(4)
     assert last_err is not None
-    raise last_err
+    raise RuntimeError(f"{last_err} / {detail}")
 
 
 def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
