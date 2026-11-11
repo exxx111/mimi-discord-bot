@@ -33,7 +33,9 @@ import os
 import re
 import time
 import random
+import asyncio
 import threading
+import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -97,6 +99,38 @@ def start_keep_alive() -> bool:
     thread.start()
     print(f"keep-alive サーバー起動: port {port}")
     return True
+
+
+# ---------- 常時稼働の維持（スリープ防止＆24時間ごとの自動再起動） ----------
+# Render無料プランは、しばらく外部からのアクセスが無いとスリープしてしまう。
+# そこで10分ごとに自分のURLへアクセスして眠らないようにし、
+# 起動から24時間たったらプロセスを終了してRenderに立ち上げ直させる
+# （終了するとRenderが自動で再起動する。再起動でメモリ内のログはリセットされる）。
+SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://mimi-discord-bot-6ol5.onrender.com")
+PING_INTERVAL = 600          # 自己アクセスの間隔（秒）
+RESTART_AFTER = 24 * 3600    # 自動再起動までの時間（秒）
+_started_at = time.time()
+_maintenance_started = False
+
+
+def _self_ping() -> None:
+    try:
+        req = urllib.request.Request(SELF_URL, headers={"User-Agent": "mimi-keepalive"})
+        with urllib.request.urlopen(req, timeout=30) as res:
+            res.read()
+    except Exception:
+        pass
+
+
+async def _maintenance_loop() -> None:
+    while True:
+        await asyncio.sleep(PING_INTERVAL)
+        await asyncio.to_thread(_self_ping)
+        if time.time() - _started_at >= RESTART_AFTER:
+            print("起動から24時間たったので、自動で再起動します", flush=True)
+            await asyncio.sleep(1)
+            os._exit(0)  # プロセス終了 → Renderが自動で再起動する
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -398,8 +432,11 @@ async def log_plain_message(message: discord.Message) -> None:
 # ---------- イベント＆コマンド ----------
 @bot.event
 async def on_ready():
-    global _tree_synced
+    global _tree_synced, _maintenance_started
     print(f"ログインしました: {bot.user} / みみボット起動OK")
+    if not _maintenance_started:
+        _maintenance_started = True
+        asyncio.create_task(_maintenance_loop())
     if not _tree_synced:
         try:
             synced = await bot.tree.sync()
