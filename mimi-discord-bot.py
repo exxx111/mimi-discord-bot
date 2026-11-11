@@ -18,12 +18,14 @@ Render等のWebサービスで動かす場合:
 会話はメンション、DM、文に「マッキー」を含めると返事するよ。
 他のボットが話しかけてきたら、ボット同士でも会話するよ（無限ループ防止つき）。
 返事はすぐ送らず、「入力中…」を出して少し考えてから送るよ。
+環境変数 GEMINI_API_KEY があれば、会話はAI（Gemini）が考えて返事するよ。
 サーバー内では全ての投稿を1通ごとにログに記録するよ。スパムっぽい投稿（連投・同じ文の
 繰り返し・リンク連投・大量メンション・招待リンク・同じ文字や絵文字の連打・改行荒らし・
 指定した監視ワード）は🚨検知つきで記録するよ（消したりBANはしないよ）。
 ログは「mimi-log」「みみログ」「spam-log」「警告botログ」「マッキーログ」という名前のチャンネルがあればそこにも流すよ。
 """
 
+import json
 import os
 import re
 import time
@@ -146,6 +148,74 @@ async def send_thoughtful_reply(message: discord.Message, reply: str, source_tex
     except Exception:
         await asyncio.sleep(min(think, 2.0))
     await message.channel.send(reply)
+
+
+
+# ---------- AI連携（Gemini・無料枠） ----------
+# 環境変数 GEMINI_API_KEY があれば、会話の返事をAIが考えて作る。
+# キーが無い／APIが失敗したときは、ルール式の chat_reply に切り替える。
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+AI_SYSTEM_PROMPT = (
+    "あなたはDiscordサーバーの見守りボット「マッキー」です。"
+    "明るくフレンドリーに、日本語で短め（1〜3文）に返事してください。"
+    "サーバーの安全を見守るのが仕事で、スパムや禁止ワードを見つけてログに記録しています。"
+    "知らないことは正直に「わかんないや」と言ってください。"
+    "長文や箇条書きは避けて、ふつうの会話らしく答えてください。"
+)
+_ai_history: dict[int, list[dict]] = defaultdict(list)
+
+
+def _gemini_generate(contents: list[dict]) -> str:
+    """Gemini APIを1回呼ぶ（同期処理なので to_thread から使う）。"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {
+        "system_instruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.9},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.load(resp)
+    parts = data["candidates"][0]["content"]["parts"]
+    return "".join(part.get("text", "") for part in parts).strip()
+
+
+async def ai_reply(user_id: int, text: str) -> str | None:
+    """AIに考えてもらう返事。失敗したら None（呼び出し側がルール返信にする）。"""
+    history = _ai_history[user_id]
+    contents = list(history) + [{"role": "user", "parts": [{"text": text}]}]
+    try:
+        reply = await asyncio.to_thread(_gemini_generate, contents)
+    except Exception as e:
+        print(f"[AI] Gemini呼び出しに失敗: {e}")
+        return None
+    if not reply:
+        return None
+    history.append({"role": "user", "parts": [{"text": text}]})
+    history.append({"role": "model", "parts": [{"text": reply}]})
+    del history[:-12]  # 直近のやりとりだけ覚える
+    return reply[:500]
+
+
+async def smart_reply(user_id: int, text: str) -> str:
+    """名前を覚える処理はルールで、会話はAI（あれば）→ダメならルール返信。"""
+    m = re.search(r"名前は\s*(.+)", text.strip())
+    if m:
+        name = m.group(1).strip(" 　です。、")[:20]
+        if name:
+            user_names[user_id] = name
+            return f"{name}って言うんだね！覚えたよ♪ よろしく、{name}！"
+    if GEMINI_API_KEY:
+        reply = await ai_reply(user_id, text)
+        if reply:
+            return reply
+    return chat_reply(user_id, text)
 
 
 # ---------- 会話 ----------
@@ -385,6 +455,7 @@ async def log_plain_message(message: discord.Message) -> None:
 async def on_ready():
     global _tree_synced, _maintenance_started
     print(f"ログインしました: {bot.user} / マッキーボット起動OK")
+    print('AI連携（Gemini）: ' + ('ON' if GEMINI_API_KEY else 'OFF（ルール返信）'))
     guild_names = " / ".join(g.name for g in bot.guilds) or "なし"
     print(f"参加中のサーバー（{len(bot.guilds)}件）: {guild_names}", flush=True)
     if not _maintenance_started:
@@ -424,7 +495,8 @@ async def on_message(message: discord.Message):
                 if bot.user:
                     clean = clean.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
                 clean = clean.replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
-                reply = chat_reply(message.author.id, clean or "こんにちは")
+                async with message.channel.typing():
+                    reply = await smart_reply(message.author.id, clean or "こんにちは")
                 if reply:
                     await send_thoughtful_reply(message, reply, clean)
         return
@@ -443,7 +515,8 @@ async def on_message(message: discord.Message):
         if bot.user:
             clean = clean.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
         clean = clean.replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
-        reply = chat_reply(message.author.id, clean or "こんにちは")
+        async with message.channel.typing():
+            reply = await smart_reply(message.author.id, clean or "こんにちは")
         if reply:
             await send_thoughtful_reply(message, reply, clean)
         return
