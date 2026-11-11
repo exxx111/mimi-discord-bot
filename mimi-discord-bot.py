@@ -24,8 +24,8 @@ Render等のWebサービスで動かす場合:
   !help_mimi / /help_mimi ヘルプ
 会話はメンション、DM、文に「みみ」を含めると返事するよ。
 サーバー内ではスパムっぽい投稿（連投・同じ文の繰り返し・リンク連投・大量メンション・
-招待リンク・同じ文字や絵文字の連打・改行荒らし）を自動で見張って、見つけたらログに残すよ
-（消したりBANはしないよ）。
+招待リンク・同じ文字や絵文字の連打・改行荒らし・指定した監視ワード）を自動で見張って、
+見つけたらログに残すよ（消したりBANはしないよ）。
 ログは「mimi-log」「みみログ」「spam-log」という名前のチャンネルがあればそこにも流すよ。
 """
 
@@ -253,6 +253,13 @@ _URL_RE = re.compile(r"https?://|www\.|\.com|\.jp|\.net|\.io", re.IGNORECASE)
 _INVITE_RE = re.compile(r"discord\.gg/|discord(app)?\.com/invite/", re.IGNORECASE)
 _EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF☀-➿⬀-⯿]")
 
+# 監視ワード：これを含む投稿は1通でも即ログ対象（ユーザーの指定リスト）
+WATCH_WORDS = [
+    "うお", "どわー", "きちー", "きちがい", "しね", "死ね",
+    "あほ", "アホ", "障害", "障がい", "生姜",
+]
+WATCH_EMOJIS = ["🫚", "🤓"]
+
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
@@ -268,6 +275,13 @@ def _detect_spam(message: discord.Message) -> str | None:
     history.append((now, _normalize(content), url_count))
 
     # 1通で即検知するタイプ
+    norm_text = _normalize(content)
+    for w in WATCH_WORDS:
+        if w in norm_text:
+            return f"監視ワード「{w}」を検知"
+    for e in WATCH_EMOJIS:
+        if e in content:
+            return f"監視絵文字「{e}」を検知"
     if _INVITE_RE.search(content):
         return "Discord招待リンクの投稿"
     if url_count >= MANY_LINKS_IN_ONE:
