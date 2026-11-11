@@ -14,7 +14,7 @@ Render等のWebサービスで動かす場合:
   環境変数 PORT が設定されていれば、ヘルスチェック用の小さな
   HTTPサーバーが別スレッドで自動起動します。ローカルでは不要です。
 
-コマンドは無し（全部削除済み）。
+コマンドは無し。ただしログ確認だけスラッシュコマンド /log（管理者だけ）を残してある。
 会話はメンション、DM、文に「マッキー」を含めると返事するよ。
 他のボットが話しかけてきたら、ボット同士でも会話するよ（無限ループ防止つき）。
 返事はすぐ送らず、「入力中…」を出して少し考えてから送るよ。
@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 # ---------- キャラクター設定：マッキー ----------
@@ -119,7 +120,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-# スラッシュコマンドは全削除済み。起動時の sync() で Discord 側の登録も消す。
+# スラッシュコマンドは /log だけ。起動時の sync() で Discord 側の登録を合わせる。
 _tree_synced = False
 # ボット同士の会話: チャンネルごとの連続応答カウント（無限ループ防止）
 BOT_TALK_MAX = 5
@@ -447,6 +448,34 @@ async def on_message(message: discord.Message):
             await send_thoughtful_reply(message, reply, clean)
         return
 
+
+
+
+def log_text(limit: int = 10) -> str:
+    """最近のログ（最新 limit 件）をテキストで返す。内容は check_and_log_spam / log_plain_message が記録。"""
+    if not log_entries:
+        return "まだログはないよ。"
+    lines = [f"📋 最近のログ（最新{limit}件）"]
+    for entry in list(log_entries)[-limit:]:
+        mark = "🚨" if entry["flagged"] else "・"
+        lines.append(
+            f"{mark} [{entry['time']}] {entry['user']} ＠{entry['channel']}: {entry['content'][:60]}"
+            + (f"（{entry['reason']}）" if entry["flagged"] else "")
+        )
+    return "\n".join(lines)
+
+
+@bot.tree.command(name="log", description="最近のログ（最新10件）を見る（管理者だけ）")
+@app_commands.default_permissions(manage_messages=True)
+async def slash_log(interaction: discord.Interaction):
+    is_admin = (
+        isinstance(interaction.user, discord.Member)
+        and interaction.user.guild_permissions.manage_messages
+    )
+    if not is_admin:
+        await interaction.response.send_message("ログはサーバーの管理者だけが見られるよ。", ephemeral=True)
+        return
+    await interaction.response.send_message(log_text(), ephemeral=True)
 
 if __name__ == "__main__":
     token = os.environ.get("DISCORD_TOKEN")
