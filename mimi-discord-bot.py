@@ -20,12 +20,12 @@ Render等のWebサービスで動かす場合:
   !janken グー          文字でも出せるよ（グー / チョキ / パー）。/janken は手の選択肢つき
   !omikuji / /omikuji   おみくじ
   !game / /game         ゲームのリンクを送るよ（!リンク でもOK、「ゲーム」って言っても送るよ）
-  !spamlog / /spamlog   スパム検知ログの最新10件を見る（管理者向け）
+  !spamlog / !log / /spamlog / /log   ログの最新10件を見る（管理者向け）
   !help_mimi / /help_mimi ヘルプ
 会話はメンション、DM、文に「みみ」を含めると返事するよ。
-サーバー内ではスパムっぽい投稿（連投・同じ文の繰り返し・リンク連投・大量メンション・
-招待リンク・同じ文字や絵文字の連打・改行荒らし・指定した監視ワード）を自動で見張って、
-見つけたらログに残すよ（消したりBANはしないよ）。
+サーバー内では全ての投稿を1通ごとにログに記録するよ。スパムっぽい投稿（連投・同じ文の
+繰り返し・リンク連投・大量メンション・招待リンク・同じ文字や絵文字の連打・改行荒らし・
+指定した監視ワード）は🚨検知つきで記録するよ（消したりBANはしないよ）。
 ログは「mimi-log」「みみログ」「spam-log」という名前のチャンネルがあればそこにも流すよ。
 """
 
@@ -239,15 +239,15 @@ REPEAT_CHAR = 20         # 同じ文字がこれ以上連続したら即検知
 MANY_NEWLINES = 15       # 1通の改行がこれ以上なら即検知
 MANY_EMOJIS = 20         # 1通の絵文字がこれ以上なら即検知
 FLAG_COOLDOWN = 30       # 同じ人を連続で記録しない間隔（秒）
-LOG_KEEP = 100           # ログの最大保持件数
+LOG_KEEP = 300           # ログの最大保持件数
 LOG_CHANNEL_NAMES = ["mimi-log", "みみログ", "spam-log"]
 
 # (guild_id, user_id) -> deque[(時刻, 正規化した文, リンク数)]
 _recent_msgs: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=30))
 # (guild_id, user_id) -> 最後に記録した時刻
 _last_flagged: dict[tuple[int, int], float] = {}
-# 検知ログ（新しいものが末尾）
-spam_log: list[dict] = []
+# ログ（新しいものが末尾）。kind="msg" は通常の投稿、kind="spam" はスパム検知
+log_entries: list[dict] = []
 
 _URL_RE = re.compile(r"https?://|www\.|\.com|\.jp|\.net|\.io", re.IGNORECASE)
 _INVITE_RE = re.compile(r"discord\.gg/|discord(app)?\.com/invite/", re.IGNORECASE)
@@ -308,50 +308,91 @@ def _detect_spam(message: discord.Message) -> str | None:
     return None
 
 
-async def check_and_log_spam(message: discord.Message) -> None:
-    """検知したらログに残し、ログ用チャンネルがあればそこにも流す。
-    管理者も含めて全員が対象（ボット自身は除く）。"""
-    if message.guild is None:
-        return
-    reason = _detect_spam(message)
-    if not reason:
-        return
-    key = (message.guild.id, message.author.id)
-    now = time.time()
-    if now - _last_flagged.get(key, 0) < FLAG_COOLDOWN:
-        return
-    _last_flagged[key] = now
+def _find_log_channel(guild: discord.Guild):
+    for name in LOG_CHANNEL_NAMES:
+        ch = discord.utils.get(guild.text_channels, name=name)
+        if ch is not None:
+            return ch
+    return None
 
-    entry = {
+
+async def _post_log(guild: discord.Guild, text: str, exclude_channel_id: int | None = None) -> None:
+    """ログ用チャンネルがあれば、そこにログを流す。"""
+    log_ch = _find_log_channel(guild)
+    if log_ch is None or log_ch.id == exclude_channel_id:
+        return
+    try:
+        await log_ch.send(text)
+    except discord.HTTPException:
+        pass
+
+
+def _base_entry(message: discord.Message, kind: str) -> dict:
+    return {
+        "kind": kind,
         "time": datetime.now(JST),
         "guild": message.guild.name,
         "channel": getattr(message.channel, "name", "DM"),
         "user": str(message.author),
         "user_id": message.author.id,
-        "reason": reason,
+        "reason": "",
         "content": (message.content or "")[:100],
         "jump_url": message.jump_url,
     }
-    spam_log.append(entry)
-    del spam_log[:-LOG_KEEP]
-    print(f"[SPAM検知] {entry['time']:%Y-%m-%d %H:%M:%S} {entry['guild']} #{entry['channel']} {entry['user']}: {reason}")
 
-    for name in LOG_CHANNEL_NAMES:
-        log_ch = discord.utils.get(message.guild.text_channels, name=name)
-        if log_ch is not None and log_ch.id != message.channel.id:
-            try:
-                await log_ch.send(
-                    "🚨 **スパム検知ログ**\n"
-                    f"・時刻: {entry['time']:%Y-%m-%d %H:%M:%S}\n"
-                    f"・ユーザー: {entry['user']}\n"
-                    f"・場所: #{entry['channel']}\n"
-                    f"・理由: {reason}\n"
-                    f"・内容: {entry['content']}\n"
-                    f"・投稿: {message.jump_url}"
-                )
-            except discord.HTTPException:
-                pass
-            break
+
+async def check_and_log_spam(message: discord.Message) -> bool:
+    """スパムっぽければログに残す。検知したら True（管理者も含め全員対象）。
+    ログ用チャンネルがあればそこにも流す。"""
+    if message.guild is None:
+        return False
+    reason = _detect_spam(message)
+    if not reason:
+        return False
+    key = (message.guild.id, message.author.id)
+    now = time.time()
+    if now - _last_flagged.get(key, 0) < FLAG_COOLDOWN:
+        return True  # 検知はしたが、連続記録を間引いた
+    _last_flagged[key] = now
+
+    entry = _base_entry(message, "spam")
+    entry["reason"] = reason
+    log_entries.append(entry)
+    del log_entries[:-LOG_KEEP]
+    print(f"[検知] {entry['time']:%Y-%m-%d %H:%M:%S} {entry['guild']} #{entry['channel']} {entry['user']}: {reason}", flush=True)
+
+    await _post_log(
+        message.guild,
+        "🚨 **ログ**\n"
+        f"・時刻: {entry['time']:%Y-%m-%d %H:%M:%S}\n"
+        f"・ユーザー: {entry['user']}\n"
+        f"・場所: #{entry['channel']}\n"
+        f"・理由: {reason}\n"
+        f"・内容: {entry['content']}\n"
+        f"・投稿: {message.jump_url}",
+        exclude_channel_id=message.channel.id,
+    )
+    return True
+
+
+async def log_plain_message(message: discord.Message) -> None:
+    """通常の投稿も1通ごとにすぐログに残す（ログ用チャンネル内とボットは除く）。"""
+    if message.guild is None:
+        return
+    if getattr(message.channel, "name", "") in LOG_CHANNEL_NAMES:
+        return
+    entry = _base_entry(message, "msg")
+    log_entries.append(entry)
+    del log_entries[:-LOG_KEEP]
+    await _post_log(
+        message.guild,
+        "📝 **ログ**\n"
+        f"・時刻: {entry['time']:%Y-%m-%d %H:%M:%S}\n"
+        f"・ユーザー: {entry['user']}\n"
+        f"・場所: #{entry['channel']}\n"
+        f"・内容: {entry['content']}",
+        exclude_channel_id=message.channel.id,
+    )
 
 
 # ---------- イベント＆コマンド ----------
@@ -372,9 +413,11 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    # サーバー内ではスパム監視（記録のみ）
+    # サーバー内では全投稿をログに記録（スパムっぽいものは検知つき）
     if message.guild is not None:
-        await check_and_log_spam(message)
+        detected = await check_and_log_spam(message)
+        if not detected:
+            await log_plain_message(message)
     # コマンドは先に処理
     if message.content.startswith("!"):
         await bot.process_commands(message)
@@ -440,27 +483,30 @@ async def omikuji(ctx: commands.Context):
 
 
 def spamlog_text(guild_name: str) -> str:
-    """スパム検知ログの表示テキスト（!版と /版で共用）。"""
-    entries = [e for e in spam_log if e["guild"] == guild_name][-10:]
+    """ログの表示テキスト（!版と /版で共用）。"""
+    entries = [e for e in log_entries if e["guild"] == guild_name][-10:]
     if not entries:
-        return "📋 スパム検知ログはまだありません。この調子で平和だね♪"
-    lines = ["📋 **スパム検知ログ（最新10件）**"]
+        return "📋 ログはまだありません。"
+    lines = ["📋 **ログ（最新10件）**"]
     for e in reversed(entries):
-        lines.append(
-            f"・{e['time']:%m/%d %H:%M} {e['user']}（#{e['channel']}）: {e['reason']}\n"
-            f"　内容: {e['content']}"
-        )
+        if e.get("kind") == "spam":
+            lines.append(
+                f"・🚨 {e['time']:%m/%d %H:%M} {e['user']}（#{e['channel']}）: {e['reason']}\n"
+                f"　内容: {e['content']}"
+            )
+        else:
+            lines.append(f"・{e['time']:%m/%d %H:%M} {e['user']}（#{e['channel']}）: {e['content']}")
     return "\n".join(lines)
 
 
-@bot.command(name="spamlog")
+@bot.command(name="spamlog", aliases=["log"])
 async def spamlog(ctx: commands.Context):
-    """!spamlog : スパム検知ログの最新10件（メッセージ管理権限のある人だけ）"""
+    """!spamlog / !log : ログの最新10件（メッセージ管理権限のある人だけ）"""
     if ctx.guild is None:
-        await ctx.send("スパムログはサーバーの中で見てね。")
+        await ctx.send("ログはサーバーの中で見てね。")
         return
     if not (isinstance(ctx.author, discord.Member) and ctx.author.guild_permissions.manage_messages):
-        await ctx.send("スパムログはサーバーの管理者だけが見られるよ。")
+        await ctx.send("ログはサーバーの管理者だけが見られるよ。")
         return
     await ctx.send(spamlog_text(ctx.guild.name))
 
@@ -510,7 +556,18 @@ async def slash_game(interaction: discord.Interaction):
     await interaction.response.send_message(game_link_text())
 
 
-@bot.tree.command(name="spamlog", description="スパム検知ログの最新10件を見る（管理者向け）")
+@bot.tree.command(name="log", description="ログの最新10件を見る（管理者向け）")
+async def slash_log(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("ログはサーバーの中で見てね。", ephemeral=True)
+        return
+    if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_messages):
+        await interaction.response.send_message("ログはサーバーの管理者だけが見られるよ。", ephemeral=True)
+        return
+    await interaction.response.send_message(spamlog_text(interaction.guild.name), ephemeral=True)
+
+
+@bot.tree.command(name="spamlog", description="ログの最新10件を見る（管理者向け）")
 async def slash_spamlog(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("スパムログはサーバーの中で見てね。", ephemeral=True)
@@ -527,7 +584,7 @@ HELP_TEXT = (
     "✊ `!janken` / `/janken` : じゃんけん対決（ボタン or 手の選択肢、スコア記録あり）\n"
     "🎋 `!omikuji` / `/omikuji` : おみくじ\n"
     "🎮 `!game` / `/game` : ゲームのリンクを送るよ（`!リンク` でもOK、「ゲーム」って言っても送るよ）\n"
-    "🚨 スパム監視中: 連投やリンク連投を見つけたらログに残すよ（管理者は `!spamlog` / `/spamlog` で確認）\n"
+    "📝 ログ: サーバーの投稿は1通ごとに全部ログに記録してるよ（スパムっぽいものは🚨検知つき）。管理者は `!log` / `/log` で確認\n"
     "👋 `!hello` / `/hello` : あいさつ"
 )
 
