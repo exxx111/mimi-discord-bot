@@ -20,15 +20,21 @@ Render等のWebサービスで動かす場合:
   !janken グー      文字でも出せるよ（グー / チョキ / パー）
   !omikuji          おみくじ
   !game             ゲームのリンクを送るよ（!リンク でもOK、「ゲーム」って言っても送るよ）
+  !spamlog          スパム検知ログの最新10件を見る（管理者向け）
   !help_mimi        ヘルプ
 会話はメンション、DM、文に「みみ」を含めると返事するよ。
+サーバー内ではスパムっぽい投稿（連投・同じ文の繰り返し・リンク連投・大量メンション）を
+自動で見張って、見つけたらログに残すよ（消したりBANはしないよ）。
+ログは「mimi-log」「みみログ」「spam-log」という名前のチャンネルがあればそこにも流すよ。
 """
 
 import os
 import re
+import time
 import random
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import discord
@@ -213,6 +219,113 @@ def chat_reply(user_id: int, text: str) -> str | None:
     return random.choice(FALLBACKS)
 
 
+# ---------- スパム監視＆ログ ----------
+# サーバー内の投稿を見張って、スパムっぽい動きを見つけたらログに残す。
+# メッセージの削除やBANはしない（検知と記録だけ）。
+JST = timezone(timedelta(hours=9))
+
+# 判定のしきい値
+BURST_COUNT = 5          # この件数を
+BURST_WINDOW = 10        # この秒数以内に送ったら「連投」
+REPEAT_COUNT = 4         # 同じ文をこの回数
+REPEAT_WINDOW = 60       # この秒数以内に送ったら「繰り返し」
+LINK_COUNT = 3           # リンク付き投稿をこの件数
+LINK_WINDOW = 60         # この秒数以内に送ったら「リンク連投」
+MANY_LINKS_IN_ONE = 4    # 1通にこれ以上のURLがあれば即検知
+MANY_MENTIONS = 5        # 1通にこれ以上のメンションがあれば即検知
+FLAG_COOLDOWN = 60       # 同じ人を連続で記録しない間隔（秒）
+LOG_KEEP = 100           # ログの最大保持件数
+LOG_CHANNEL_NAMES = ["mimi-log", "みみログ", "spam-log"]
+
+# (guild_id, user_id) -> deque[(時刻, 正規化した文, リンク数)]
+_recent_msgs: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=30))
+# (guild_id, user_id) -> 最後に記録した時刻
+_last_flagged: dict[tuple[int, int], float] = {}
+# 検知ログ（新しいものが末尾）
+spam_log: list[dict] = []
+
+_URL_RE = re.compile(r"https?://|www\.|\.com|\.jp|\.net|\.io", re.IGNORECASE)
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _detect_spam(message: discord.Message) -> str | None:
+    """スパムっぽければ理由を返す。違えば None。"""
+    now = time.time()
+    key = (message.guild.id, message.author.id)
+    history = _recent_msgs[key]
+    content = message.content or ""
+    url_count = len(_URL_RE.findall(content))
+    history.append((now, _normalize(content), url_count))
+
+    # 1通で即検知するタイプ
+    if url_count >= MANY_LINKS_IN_ONE:
+        return f"1通にリンクが{url_count}個"
+    if len(message.mentions) >= MANY_MENTIONS:
+        return f"1通にメンションが{len(message.mentions)}人"
+
+    # 一定時間内の履歴で判定
+    recent_all = [h for h in history if now - h[0] <= REPEAT_WINDOW]
+    if len([h for h in history if now - h[0] <= BURST_WINDOW]) >= BURST_COUNT:
+        return f"{BURST_WINDOW}秒以内に{BURST_COUNT}件以上の連投"
+    norm = _normalize(content)
+    if norm and len([h for h in recent_all if h[1] == norm]) >= REPEAT_COUNT:
+        return f"同じ文を{REPEAT_WINDOW}秒以内に{REPEAT_COUNT}回"
+    if len([h for h in recent_all if h[2] > 0]) >= LINK_COUNT:
+        return f"リンク付き投稿を{LINK_WINDOW}秒以内に{LINK_COUNT}件"
+    return None
+
+
+async def check_and_log_spam(message: discord.Message) -> None:
+    """検知したらログに残し、ログ用チャンネルがあればそこにも流す。"""
+    if message.guild is None:
+        return
+    # メッセージ管理権限のある人（モデレーター等）は対象外
+    if isinstance(message.author, discord.Member) and message.author.guild_permissions.manage_messages:
+        return
+    reason = _detect_spam(message)
+    if not reason:
+        return
+    key = (message.guild.id, message.author.id)
+    now = time.time()
+    if now - _last_flagged.get(key, 0) < FLAG_COOLDOWN:
+        return
+    _last_flagged[key] = now
+
+    entry = {
+        "time": datetime.now(JST),
+        "guild": message.guild.name,
+        "channel": getattr(message.channel, "name", "DM"),
+        "user": str(message.author),
+        "user_id": message.author.id,
+        "reason": reason,
+        "content": (message.content or "")[:100],
+        "jump_url": message.jump_url,
+    }
+    spam_log.append(entry)
+    del spam_log[:-LOG_KEEP]
+    print(f"[SPAM検知] {entry['time']:%Y-%m-%d %H:%M:%S} {entry['guild']} #{entry['channel']} {entry['user']}: {reason}")
+
+    for name in LOG_CHANNEL_NAMES:
+        log_ch = discord.utils.get(message.guild.text_channels, name=name)
+        if log_ch is not None and log_ch.id != message.channel.id:
+            try:
+                await log_ch.send(
+                    "🚨 **スパム検知ログ**\n"
+                    f"・時刻: {entry['time']:%Y-%m-%d %H:%M:%S}\n"
+                    f"・ユーザー: {entry['user']}\n"
+                    f"・場所: #{entry['channel']}\n"
+                    f"・理由: {reason}\n"
+                    f"・内容: {entry['content']}\n"
+                    f"・投稿: {message.jump_url}"
+                )
+            except discord.HTTPException:
+                pass
+            break
+
+
 # ---------- イベント＆コマンド ----------
 @bot.event
 async def on_ready():
@@ -223,6 +336,9 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+    # サーバー内ではスパム監視（記録のみ）
+    if message.guild is not None:
+        await check_and_log_spam(message)
     # コマンドは先に処理
     if message.content.startswith("!"):
         await bot.process_commands(message)
@@ -287,6 +403,28 @@ async def omikuji(ctx: commands.Context):
     await ctx.send(f"🎋 {ctx.author.display_name} のおみくじは **{result}**！{comments.get(result, 'いい日になる予感だよ♪')}")
 
 
+@bot.command(name="spamlog")
+async def spamlog(ctx: commands.Context):
+    """!spamlog : スパム検知ログの最新10件（メッセージ管理権限のある人だけ）"""
+    if ctx.guild is None:
+        await ctx.send("スパムログはサーバーの中で見てね。")
+        return
+    if not (isinstance(ctx.author, discord.Member) and ctx.author.guild_permissions.manage_messages):
+        await ctx.send("スパムログはサーバーの管理者だけが見られるよ。")
+        return
+    entries = [e for e in spam_log if e["guild"] == ctx.guild.name][-10:]
+    if not entries:
+        await ctx.send("📋 スパム検知ログはまだありません。この調子で平和だね♪")
+        return
+    lines = ["📋 **スパム検知ログ（最新10件）**"]
+    for e in reversed(entries):
+        lines.append(
+            f"・{e['time']:%m/%d %H:%M} {e['user']}（#{e['channel']}）: {e['reason']}\n"
+            f"　内容: {e['content']}"
+        )
+    await ctx.send("\n".join(lines))
+
+
 @bot.command(name="help_mimi")
 async def help_mimi(ctx: commands.Context):
     await ctx.send(
@@ -296,6 +434,7 @@ async def help_mimi(ctx: commands.Context):
         "✌️ `!janken グー` : 文字で即対決\n"
         "🎋 `!omikuji` : おみくじ\n"
         "🎮 `!game` : ゲームのリンクを送るよ（`!リンク` でもOK、「ゲーム」って言っても送るよ）\n"
+        "🚨 スパム監視中: 連投やリンク連投を見つけたらログに残すよ（管理者は `!spamlog` で確認）\n"
         "👋 `!hello` : あいさつ"
     )
 
