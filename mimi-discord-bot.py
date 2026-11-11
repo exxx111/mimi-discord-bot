@@ -156,7 +156,7 @@ async def send_thoughtful_reply(message: discord.Message, reply: str, source_tex
 # 環境変数 GEMINI_API_KEY があれば、会話の返事をAIが考えて作る。
 # キーが無い／APIが失敗したときは、ルール式の chat_reply に切り替える。
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "").strip(), "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"] if m]
+GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "").strip(), "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-flash-latest"] if m]
 _working_model: str | None = None  # 実際に使えたモデルを覚えておく
 AI_SYSTEM_PROMPT = (
     "あなたはDiscordサーバーの見守りボット「マッキー」です。"
@@ -185,7 +185,7 @@ def _gemini_call(model: str, contents: list[dict]) -> str:
         headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.load(resp)
     parts = data["candidates"][0]["content"]["parts"]
     return "".join(part.get("text", "") for part in parts).strip()
@@ -209,8 +209,11 @@ def _gemini_generate(contents: list[dict]) -> str:
             return text
         except urllib.error.HTTPError as e:
             last_err = e
-            if e.code not in (400, 404):
+            if e.code not in (400, 404, 429, 503):
                 raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # 混雑・タイムアウトのときは次の候補モデルで試す
+            last_err = e
     assert last_err is not None
     raise last_err
 
