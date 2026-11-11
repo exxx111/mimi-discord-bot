@@ -206,6 +206,20 @@ AI_SYSTEM_PROMPT = (
     "サーバーの安全を見守るのが仕事で、スパムや禁止ワードを見つけてログに記録しています。"
     "知らないことは正直に「わかんないや」と言ってください。うそはつかないでください。"
 )
+def _system_prompt() -> str:
+    """AI_SYSTEM_PROMPT に今日の日付と調べものの指示を足したもの。"""
+    now = datetime.now(timezone(timedelta(hours=9)))
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    today = f"{now.year}年{now.month}月{now.day}日（{weekdays[now.weekday()]}）{now.hour}時{now.minute:02d}分"
+    return (
+        AI_SYSTEM_PROMPT
+        + f"今は{today}（日本時間）です。"
+        + "あなたは天気予報・ニュース・Web検索で調べものができて、頼まれればリマインダー（○分後に知らせる）もできます。"
+        + "ユーザーの発言に【調べた情報】が付いていたら、その情報をもとに具体的に答えてください（数字や固有名詞は情報のものをそのまま使う）。"
+        + "調べた情報が付いていない最新ニュースや天気は、知らないと正直に言ってください。"
+    )
+
+
 # 会話履歴は (話し手, 本文) の形で持ち、各AIの形式に変換して渡す
 _ai_history: dict[int, list[tuple[str, str]]] = defaultdict(list)
 
@@ -226,7 +240,7 @@ def _groq_call(model: str, messages: list[dict], timeout: float = 20) -> str:
 
 def _groq_generate(history: list[tuple[str, str]], text: str) -> str:
     """Groqで返事を作る。混雑時はモデルを替えながら少し粘る。"""
-    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": _system_prompt()}]
     for who, body in history:
         messages.append({"role": "user" if who == "user" else "assistant", "content": body})
     messages.append({"role": "user", "content": text})
@@ -266,7 +280,7 @@ def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
     if model.startswith("gemini-2.5"):
         gen_config["thinkingConfig"] = {"thinkingBudget": 0}
     payload = {
-        "system_instruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
+        "system_instruction": {"parts": [{"text": _system_prompt()}]},
         "contents": contents,
         "generationConfig": gen_config,
     }
@@ -327,16 +341,20 @@ async def ai_reply(user_id: int, text: str) -> str | None:
     """AIに考えてもらう返事（Groq優先→Gemini）。全部ダメなら None。"""
     history = _ai_history[user_id]
     reply: str | None = None
+    ai_text = text
+    kind, ctx = await asyncio.to_thread(_lookup_context, text)
+    if ctx:
+        ai_text = f"【調べた情報】\n{ctx}\n\n【ユーザーの発言】\n{text}"
     if GROQ_API_KEY:
         try:
-            reply = await asyncio.to_thread(_groq_generate, list(history), text)
+            reply = await asyncio.to_thread(_groq_generate, list(history), ai_text)
         except Exception as e:
             print(f"[AI] Groq呼び出しに失敗: {e}")
     if not reply and GEMINI_API_KEY:
         contents = [
             {"role": "user" if who == "user" else "model", "parts": [{"text": body}]}
             for who, body in history
-        ] + [{"role": "user", "parts": [{"text": text}]}]
+        ] + [{"role": "user", "parts": [{"text": ai_text}]}]
         try:
             reply = await asyncio.to_thread(_gemini_generate, contents)
         except Exception as e:
@@ -362,6 +380,230 @@ async def smart_reply(user_id: int, text: str) -> str:
         if reply:
             return reply
     return chat_reply(user_id, text)
+
+
+
+# ---------- 調べもの（Web検索・Wikipedia・天気・ニュース） ----------
+import html as _html
+import urllib.parse as _urlparse
+
+_UA = {"User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"}
+
+
+def _http_get_text(url: str, timeout: float = 10) -> str:
+    req = urllib.request.Request(url, headers=_UA)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "ignore")
+
+
+def _http_get_json(url: str, timeout: float = 10):
+    return json.loads(_http_get_text(url, timeout))
+
+
+def _strip_tags(x: str) -> str:
+    return _html.unescape(re.sub(r"<[^>]+>", "", x)).strip()
+
+
+def _web_search(query: str) -> str:
+    """DuckDuckGo（キー不要）でWeb検索し、上位のタイトル・要約・URLを返す。"""
+    try:
+        page = _http_get_text("https://html.duckduckgo.com/html/?q=" + _urlparse.quote(query))
+    except Exception as e:
+        print(f"[調べもの] Web検索に失敗: {e}")
+        return ""
+    titles = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
+    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
+    lines = []
+    for i, (href, title) in enumerate(titles[:5]):
+        url = href
+        qs = _urlparse.parse_qs(_urlparse.urlparse("https:" + href if href.startswith("//") else href).query)
+        if "uddg" in qs:
+            url = qs["uddg"][0]
+        snippet = _strip_tags(snippets[i]) if i < len(snippets) else ""
+        lines.append(f"・{_strip_tags(title)}: {snippet} ({url})")
+    return "\n".join(lines)
+
+
+def _wiki_lookup(query: str) -> str:
+    """日本語Wikipediaで用語を調べ、冒頭の説明を返す。"""
+    try:
+        api = (
+            "https://ja.wikipedia.org/w/api.php?action=query&format=json&prop=extracts"
+            "&exintro=1&explaintext=1&generator=search&gsrlimit=3&gsrsearch="
+            + _urlparse.quote(query)
+        )
+        data = _http_get_json(api)
+        pages = (data.get("query") or {}).get("pages") or {}
+        lines = []
+        for pg in pages.values():
+            extract = (pg.get("extract") or "").strip()
+            if extract:
+                lines.append(f"・{pg.get('title', '')}: {extract[:400]}")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[調べもの] Wikipedia取得に失敗: {e}")
+        return ""
+
+
+_WEATHER_CODES = {
+    0: "快晴", 1: "晴れ", 2: "晴れ時々くもり", 3: "くもり", 45: "霧", 48: "霧",
+    51: "霧雨", 53: "霧雨", 55: "霧雨", 56: "着氷性の霧雨", 57: "着氷性の霧雨",
+    61: "弱い雨", 63: "雨", 65: "強い雨", 66: "着氷性の雨", 67: "着氷性の雨",
+    71: "弱い雪", 73: "雪", 75: "強い雪", 77: "雪",
+    80: "にわか雨", 81: "にわか雨", 82: "激しいにわか雨", 85: "にわか雪", 86: "にわか雪",
+    95: "雷雨", 96: "雷雨（ひょう）", 99: "雷雨（ひょう）",
+}
+
+
+# 主要都市は座標を内蔵（Open-Meteoの地名検索は日本語名にマッチしないため）
+_PLACE_COORDS = {
+    "東京": (35.6895, 139.6917, "東京"), "横浜": (35.4437, 139.6380, "横浜"),
+    "川崎": (35.5308, 139.7029, "川崎"), "さいたま": (35.8617, 139.6455, "さいたま"),
+    "千葉": (35.6074, 140.1065, "千葉"), "大阪": (34.6938, 135.5023, "大阪"),
+    "京都": (35.0116, 135.7681, "京都"), "神戸": (34.6901, 135.1956, "神戸"),
+    "奈良": (34.6851, 135.8050, "奈良"), "和歌山": (34.2261, 135.1675, "和歌山"),
+    "名古屋": (35.1815, 136.9066, "名古屋"), "札幌": (43.0621, 141.3544, "札幌"),
+    "仙台": (38.2682, 140.8694, "仙台"), "福岡": (33.5904, 130.4017, "福岡"),
+    "北九州": (33.8834, 130.8752, "北九州"), "広島": (34.3853, 132.4553, "広島"),
+    "新潟": (37.9161, 139.0364, "新潟"), "静岡": (34.9756, 138.3828, "静岡"),
+    "岡山": (34.6551, 133.9195, "岡山"), "熊本": (32.8062, 130.7058, "熊本"),
+    "鹿児島": (31.5602, 130.5581, "鹿児島"), "那覇": (26.2124, 127.6809, "那覇"),
+    "沖縄": (26.2124, 127.6809, "那覇"), "松山": (33.8392, 132.7657, "松山"),
+    "高松": (34.3401, 134.0434, "高松"), "金沢": (36.5944, 136.6256, "金沢"),
+    "長野": (36.6486, 138.1942, "長野"), "岐阜": (35.4233, 136.7606, "岐阜"),
+    "福井": (36.0652, 136.2216, "福井"), "富山": (36.6959, 137.2137, "富山"),
+    "甲府": (35.6642, 138.5684, "甲府"), "前橋": (36.3895, 139.0634, "前橋"),
+    "宇都宮": (36.5551, 139.8829, "宇都宮"), "水戸": (36.3418, 140.4468, "水戸"),
+    "福島": (37.7607, 140.4747, "福島"), "山形": (38.2404, 140.3633, "山形"),
+    "盛岡": (39.7036, 141.1527, "盛岡"), "秋田": (39.7186, 140.1024, "秋田"),
+    "青森": (40.8244, 140.7400, "青森"), "松江": (35.4723, 133.0486, "松江"),
+    "鳥取": (35.5039, 134.2378, "鳥取"), "山口": (34.1859, 131.4714, "山口"),
+    "徳島": (34.0703, 134.5548, "徳島"), "高知": (33.5490, 133.5311, "高知"),
+    "宮崎": (31.9111, 131.4202, "宮崎"), "大分": (33.2382, 131.6126, "大分"),
+    "佐賀": (33.2494, 130.2988, "佐賀"), "長崎": (32.7448, 129.8737, "長崎"),
+    "大津": (35.0045, 135.8686, "大津"), "津": (34.7303, 136.5086, "津"),
+}
+
+
+def _weather_lookup(place: str) -> str:
+    """Open-Meteo（キー不要）で3日分の天気予報を返す。主要都市は内蔵座標を使う。"""
+    try:
+        lat = lon = None
+        disp = place
+        for key in sorted(_PLACE_COORDS, key=len, reverse=True):
+            if key in place:
+                lat, lon, disp = _PLACE_COORDS[key]
+                break
+        if lat is None:
+            geo = _http_get_json(
+                "https://geocoding-api.open-meteo.com/v1/search?count=1&language=ja&format=json&name="
+                + _urlparse.quote(place)
+            )
+            results = geo.get("results") or []
+            if not results:
+                return ""
+            top = results[0]
+            lat, lon, disp = top["latitude"], top["longitude"], top.get("name", place)
+        fc = _http_get_json(
+            "https://api.open-meteo.com/v1/forecast?timezone=Asia%2FTokyo&forecast_days=3"
+            "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+            f"&latitude={lat}&longitude={lon}"
+        )
+        daily = fc.get("daily") or {}
+        labels = ["今日", "明日", "明後日"]
+        lines = [f"{disp}の天気予報（Open-Meteo）:"]
+        for i in range(min(3, len(daily.get("time", [])))):
+            code = daily["weather_code"][i]
+            lines.append(
+                f"・{labels[i]}: {_WEATHER_CODES.get(code, '不明')}、"
+                f"最高{daily['temperature_2m_max'][i]}℃／最低{daily['temperature_2m_min'][i]}℃、"
+                f"降水確率{daily['precipitation_probability_max'][i]}%"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[調べもの] 天気取得に失敗: {e}")
+        return ""
+
+
+def _news_lookup() -> str:
+    """NHKニュースのRSSから最新見出しを返す。"""
+    try:
+        xml = _http_get_text("https://www3.nhk.or.jp/rss/news/cat0.xml")
+        items = re.findall(r"<item>(.*?)</item>", xml, re.S)
+        lines = ["最新のニュース見出し（NHK）:"]
+        for item in items[:8]:
+            m = re.search(r"<title>(.*?)</title>", item, re.S)
+            if m:
+                title = m.group(1).replace("<![CDATA[", "").replace("]]>", "")
+                lines.append(f"・{_strip_tags(title)}")
+        return "\n".join(lines) if len(lines) > 1 else ""
+    except Exception as e:
+        print(f"[調べもの] ニュース取得に失敗: {e}")
+        return ""
+
+
+def _lookup_context(text: str) -> tuple[str, str]:
+    """発言内容を見て、必要な調べものを実行し (種類, 結果テキスト) を返す。"""
+    if "天気" in text:
+        place = re.sub(r"(天気|予報|調べて|教えて|知りたい|今日|明日|明後日|の|は|って|どう|かな|を|に|！|!|？|\?|。|、|\s)", "", text)
+        if not place or len(place) > 10:
+            place = "東京"
+        print(f"[調べもの] 天気: {place}")
+        return "天気", _weather_lookup(place)
+    if "ニュース" in text:
+        print("[調べもの] ニュース")
+        return "ニュース", _news_lookup()
+    if any(w in text for w in ("調べて", "検索して", "検索", "探して", "ググって")):
+        query = text
+        for w in ("調べて", "検索して", "検索", "探して", "ググって", "教えて", "知りたい", "について", "って何", "とは"):
+            query = query.replace(w, " ")
+        query = re.sub(r"[？?。！!]", " ", query).strip()
+        if len(query) >= 2:
+            print(f"[調べもの] 検索: {query}")
+            parts = [x for x in (_web_search(query), _wiki_lookup(query)) if x]
+            return "検索", "\n".join(parts)
+    return "", ""
+
+
+# ---------- リマインダー ----------
+_REMINDER_RE = re.compile(r"(\d+)\s*(秒|分|時間)後")
+_REMINDER_WORDS = ("教えて", "知らせて", "リマインド", "起こして", "声かけ", "声掛け", "呼んで")
+_reminder_tasks: set = set()
+
+
+def _parse_reminder(text: str) -> tuple[int, str, str] | None:
+    """「○分後に△△を教えて」→ (秒数, 表示ラベル, 用件)。違えば None。"""
+    m = _REMINDER_RE.search(text)
+    if not m or not any(w in text for w in _REMINDER_WORDS):
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    seconds = n * {"秒": 1, "分": 60, "時間": 3600}[unit]
+    if seconds < 5 or seconds > 86400:
+        return None
+    note = _REMINDER_RE.sub("", text)
+    for w in _REMINDER_WORDS + ("を", "に", "へ", "って", "ください", "お願い", "ね"):
+        note = note.replace(w, " ")
+    note = re.sub(r"[。！!？?\s]+", " ", note).strip()
+    return seconds, f"{n}{unit}後", note
+
+
+async def _reminder_fire(message: discord.Message, seconds: int, note: str) -> None:
+    await asyncio.sleep(seconds)
+    text = f"{message.author.mention} ⏰ 時間だよ！"
+    if note:
+        text += f"「{note}」の時間だよ。"
+    try:
+        await message.channel.send(text)
+    except Exception as e:
+        print(f"[リマインダー] 送信に失敗: {e}")
+
+
+def _schedule_reminder(message: discord.Message, seconds: int, note: str) -> None:
+    task = asyncio.create_task(_reminder_fire(message, seconds, note))
+    _reminder_tasks.add(task)
+    task.add_done_callback(_reminder_tasks.discard)
+    print(f"[リマインダー] {seconds}秒後に設定: {note}")
 
 
 # ---------- 会話 ----------
@@ -745,6 +987,12 @@ async def on_message(message: discord.Message):
         if bot.user:
             clean = clean.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
         clean = clean.replace("マッキー", "", 1).replace("警告bot", "", 1).replace("みみ", "", 1).strip(" 、,")
+        rem = _parse_reminder(clean)
+        if rem:
+            seconds, label, note = rem
+            _schedule_reminder(message, seconds, note)
+            await send_thoughtful_reply(message, f"おけ！{label}に知らせるね。", clean)
+            return
         async with message.channel.typing():
             reply = await smart_reply(message.author.id, clean or "こんにちは")
         if reply:
