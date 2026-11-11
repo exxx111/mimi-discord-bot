@@ -32,6 +32,7 @@ import time
 import random
 import asyncio
 import threading
+import urllib.error
 import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -155,7 +156,8 @@ async def send_thoughtful_reply(message: discord.Message, reply: str, source_tex
 # 環境変数 GEMINI_API_KEY があれば、会話の返事をAIが考えて作る。
 # キーが無い／APIが失敗したときは、ルール式の chat_reply に切り替える。
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "").strip(), "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"] if m]
+_working_model: str | None = None  # 実際に使えたモデルを覚えておく
 AI_SYSTEM_PROMPT = (
     "あなたはDiscordサーバーの見守りボット「マッキー」です。"
     "明るくフレンドリーに、日本語で短め（1〜3文）に返事してください。"
@@ -166,9 +168,9 @@ AI_SYSTEM_PROMPT = (
 _ai_history: dict[int, list[dict]] = defaultdict(list)
 
 
-def _gemini_generate(contents: list[dict]) -> str:
-    """Gemini APIを1回呼ぶ（同期処理なので to_thread から使う）。"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+def _gemini_call(model: str, contents: list[dict]) -> str:
+    """指定モデルでGemini APIを1回呼ぶ。"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {
         "system_instruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
         "contents": contents,
@@ -184,6 +186,30 @@ def _gemini_generate(contents: list[dict]) -> str:
         data = json.load(resp)
     parts = data["candidates"][0]["content"]["parts"]
     return "".join(part.get("text", "") for part in parts).strip()
+
+
+def _gemini_generate(contents: list[dict]) -> str:
+    """使えるモデルを探しながらGeminiを呼ぶ（同期処理なので to_thread から使う）。
+
+    モデル名が変わって404になるときがあるので、候補を順に試し、
+    使えたモデルを覚えて次回からそれを使う。
+    """
+    global _working_model
+    candidates = ([_working_model] if _working_model else []) + [m for m in GEMINI_MODELS if m != _working_model]
+    last_err: Exception | None = None
+    for model in candidates:
+        try:
+            text = _gemini_call(model, contents)
+            if _working_model != model:
+                _working_model = model
+                print(f"[AI] 使用モデル: {model}")
+            return text
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code not in (400, 404):
+                raise
+    assert last_err is not None
+    raise last_err
 
 
 async def ai_reply(user_id: int, text: str) -> str | None:
