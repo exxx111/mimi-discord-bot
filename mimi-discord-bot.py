@@ -172,12 +172,19 @@ _ai_history: dict[int, list[dict]] = defaultdict(list)
 
 
 def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
-    """指定モデルでGemini APIを1回呼ぶ。"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    """指定モデルでGemini APIをストリーミング呼び出しする。
+
+    完成まで待つ方式だと混雑時に読み取りタイムアウトになるため、
+    少しずつ流れてくる方式（SSE）で受け取る。2.5系は思考をオフにして速くする。
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse"
+    gen_config: dict = {"maxOutputTokens": 800, "temperature": 0.9}
+    if model.startswith("gemini-2.5"):
+        gen_config["thinkingConfig"] = {"thinkingBudget": 0}
     payload = {
         "system_instruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": 800, "temperature": 0.9},
+        "generationConfig": gen_config,
     }
     req = urllib.request.Request(
         url,
@@ -185,10 +192,22 @@ def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
         headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
         method="POST",
     )
+    texts: list[str] = []
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.load(resp)
-    parts = data["candidates"][0]["content"]["parts"]
-    return "".join(part.get("text", "") for part in parts).strip()
+        for raw in resp:
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line.startswith("data:"):
+                continue
+            chunk = line[len("data:"):].strip()
+            if not chunk or chunk == "[DONE]":
+                continue
+            try:
+                data = json.loads(chunk)
+                for part in data["candidates"][0]["content"]["parts"]:
+                    texts.append(part.get("text", ""))
+            except Exception:
+                continue
+    return "".join(texts).strip()
 
 
 def _gemini_generate(contents: list[dict]) -> str:
