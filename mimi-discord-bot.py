@@ -14,14 +14,14 @@ Render等のWebサービスで動かす場合:
   環境変数 PORT が設定されていれば、ヘルスチェック用の小さな
   HTTPサーバーが別スレッドで自動起動します。ローカルでは不要です。
 
-コマンド:
-  !hello            あいさつ
-  !janken           ボタンでじゃんけん対決（スコア付き）
-  !janken グー      文字でも出せるよ（グー / チョキ / パー）
-  !omikuji          おみくじ
-  !game             ゲームのリンクを送るよ（!リンク でもOK、「ゲーム」って言っても送るよ）
-  !spamlog          スパム検知ログの最新10件を見る（管理者向け）
-  !help_mimi        ヘルプ
+コマンド（!版と /スラッシュ版の両方があるよ）:
+  !hello / /hello       あいさつ
+  !janken / /janken     ボタンでじゃんけん対決（スコア付き）
+  !janken グー          文字でも出せるよ（グー / チョキ / パー）。/janken は手の選択肢つき
+  !omikuji / /omikuji   おみくじ
+  !game / /game         ゲームのリンクを送るよ（!リンク でもOK、「ゲーム」って言っても送るよ）
+  !spamlog / /spamlog   スパム検知ログの最新10件を見る（管理者向け）
+  !help_mimi / /help_mimi ヘルプ
 会話はメンション、DM、文に「みみ」を含めると返事するよ。
 サーバー内ではスパムっぽい投稿（連投・同じ文の繰り返し・リンク連投・大量メンション）を
 自動で見張って、見つけたらログに残すよ（消したりBANはしないよ）。
@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 # ---------- キャラクター設定：みみ ----------
@@ -329,7 +330,15 @@ async def check_and_log_spam(message: discord.Message) -> None:
 # ---------- イベント＆コマンド ----------
 @bot.event
 async def on_ready():
+    global _tree_synced
     print(f"ログインしました: {bot.user} / みみボット起動OK")
+    if not _tree_synced:
+        try:
+            synced = await bot.tree.sync()
+            _tree_synced = True
+            print(f"スラッシュコマンドを同期しました: {len(synced)}件")
+        except Exception as e:
+            print(f"スラッシュコマンドの同期に失敗: {e}")
 
 
 @bot.event
@@ -403,6 +412,20 @@ async def omikuji(ctx: commands.Context):
     await ctx.send(f"🎋 {ctx.author.display_name} のおみくじは **{result}**！{comments.get(result, 'いい日になる予感だよ♪')}")
 
 
+def spamlog_text(guild_name: str) -> str:
+    """スパム検知ログの表示テキスト（!版と /版で共用）。"""
+    entries = [e for e in spam_log if e["guild"] == guild_name][-10:]
+    if not entries:
+        return "📋 スパム検知ログはまだありません。この調子で平和だね♪"
+    lines = ["📋 **スパム検知ログ（最新10件）**"]
+    for e in reversed(entries):
+        lines.append(
+            f"・{e['time']:%m/%d %H:%M} {e['user']}（#{e['channel']}）: {e['reason']}\n"
+            f"　内容: {e['content']}"
+        )
+    return "\n".join(lines)
+
+
 @bot.command(name="spamlog")
 async def spamlog(ctx: commands.Context):
     """!spamlog : スパム検知ログの最新10件（メッセージ管理権限のある人だけ）"""
@@ -412,31 +435,79 @@ async def spamlog(ctx: commands.Context):
     if not (isinstance(ctx.author, discord.Member) and ctx.author.guild_permissions.manage_messages):
         await ctx.send("スパムログはサーバーの管理者だけが見られるよ。")
         return
-    entries = [e for e in spam_log if e["guild"] == ctx.guild.name][-10:]
-    if not entries:
-        await ctx.send("📋 スパム検知ログはまだありません。この調子で平和だね♪")
-        return
-    lines = ["📋 **スパム検知ログ（最新10件）**"]
-    for e in reversed(entries):
-        lines.append(
-            f"・{e['time']:%m/%d %H:%M} {e['user']}（#{e['channel']}）: {e['reason']}\n"
-            f"　内容: {e['content']}"
-        )
-    await ctx.send("\n".join(lines))
+    await ctx.send(spamlog_text(ctx.guild.name))
 
 
 @bot.command(name="help_mimi")
 async def help_mimi(ctx: commands.Context):
-    await ctx.send(
-        "**みみの使い方**\n"
-        "💬 会話: DM、メンション、文に「みみ」を入れて話しかけてね。「名前は〇〇」で名前を覚えるよ\n"
-        "✊ `!janken` : ボタンでじゃんけん対決（スコア記録あり）\n"
-        "✌️ `!janken グー` : 文字で即対決\n"
-        "🎋 `!omikuji` : おみくじ\n"
-        "🎮 `!game` : ゲームのリンクを送るよ（`!リンク` でもOK、「ゲーム」って言っても送るよ）\n"
-        "🚨 スパム監視中: 連投やリンク連投を見つけたらログに残すよ（管理者は `!spamlog` で確認）\n"
-        "👋 `!hello` : あいさつ"
-    )
+    await ctx.send(HELP_TEXT)
+
+
+# ---------- スラッシュコマンド（/ で出てくる版） ----------
+# 起動時に bot.tree.sync() で Discord に登録される。
+_tree_synced = False
+
+
+@bot.tree.command(name="hello", description="みみがあいさつするよ")
+async def slash_hello(interaction: discord.Interaction):
+    name = user_names.get(interaction.user.id, interaction.user.display_name)
+    await interaction.response.send_message(f"やっほー、{name}！みみだよ♪ 会話はメンションかDMで、じゃんけんは `/janken` だよ！")
+
+
+@bot.tree.command(name="janken", description="みみとじゃんけん対決！")
+@app_commands.describe(hand="手を選ぶと即対決。選ばないとボタン対決になるよ")
+@app_commands.choices(hand=[
+    app_commands.Choice(name="グー", value="グー"),
+    app_commands.Choice(name="チョキ", value="チョキ"),
+    app_commands.Choice(name="パー", value="パー"),
+])
+async def slash_janken(interaction: discord.Interaction, hand: str = None):
+    if hand is None:
+        await interaction.response.send_message(
+            f"{interaction.user.display_name} とじゃんけん対決！手を選んでね♪\n最初はグー…じゃんけん・ぽん！",
+            view=JankenView(interaction.user),
+        )
+        return
+    await interaction.response.send_message(janken_result_text(interaction.user, hand, random.choice(HANDS)))
+
+
+@bot.tree.command(name="omikuji", description="今日の運勢をおみくじで占うよ")
+async def slash_omikuji(interaction: discord.Interaction):
+    result = random.choice(["大吉", "中吉", "小吉", "吉", "末吉", "凶"])
+    comments = {"大吉": "すごーい大吉！今日は最高の一日だよ♪", "凶": "凶…でも大丈夫、みみが応援してるからね！"}
+    await interaction.response.send_message(f"🎋 {interaction.user.display_name} のおみくじは **{result}**！{comments.get(result, 'いい日になる予感だよ♪')}")
+
+
+@bot.tree.command(name="game", description="コインタップゲームのリンクを送るよ")
+async def slash_game(interaction: discord.Interaction):
+    await interaction.response.send_message(game_link_text())
+
+
+@bot.tree.command(name="spamlog", description="スパム検知ログの最新10件を見る（管理者向け）")
+async def slash_spamlog(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("スパムログはサーバーの中で見てね。", ephemeral=True)
+        return
+    if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_messages):
+        await interaction.response.send_message("スパムログはサーバーの管理者だけが見られるよ。", ephemeral=True)
+        return
+    await interaction.response.send_message(spamlog_text(interaction.guild.name), ephemeral=True)
+
+
+HELP_TEXT = (
+    "**みみの使い方**\n"
+    "💬 会話: DM、メンション、文に「みみ」を入れて話しかけてね。「名前は〇〇」で名前を覚えるよ\n"
+    "✊ `!janken` / `/janken` : じゃんけん対決（ボタン or 手の選択肢、スコア記録あり）\n"
+    "🎋 `!omikuji` / `/omikuji` : おみくじ\n"
+    "🎮 `!game` / `/game` : ゲームのリンクを送るよ（`!リンク` でもOK、「ゲーム」って言っても送るよ）\n"
+    "🚨 スパム監視中: 連投やリンク連投を見つけたらログに残すよ（管理者は `!spamlog` / `/spamlog` で確認）\n"
+    "👋 `!hello` / `/hello` : あいさつ"
+)
+
+
+@bot.tree.command(name="help_mimi", description="みみの使い方を表示するよ")
+async def slash_help(interaction: discord.Interaction):
+    await interaction.response.send_message(HELP_TEXT)
 
 
 if __name__ == "__main__":
