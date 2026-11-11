@@ -904,7 +904,7 @@ def _save_detection_to_cloud(entry: dict) -> None:
             headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             resp.read()
         print(f"[ログ保存] 検知をクラウドに保存しました: {entry.get('reason', '')}", flush=True)
     except Exception as e:
@@ -920,7 +920,7 @@ def _load_detections_from_cloud(limit: int = 100) -> list[dict]:
     ):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 data = json.load(resp)
             break
         except Exception as e:
@@ -1243,7 +1243,7 @@ async def on_ready():
     print('AI連携: ' + ('Groq' if GROQ_API_KEY else 'Gemini' if GEMINI_API_KEY else 'OFF（ルール返信）'))
     guild_names = " / ".join(g.name for g in bot.guilds) or "なし"
     print(f"参加中のサーバー（{len(bot.guilds)}件）: {guild_names}", flush=True)
-    await _restore_cloud_log_once()
+    asyncio.create_task(_restore_cloud_log_once())
     if not _maintenance_started:
         _maintenance_started = True
         asyncio.create_task(_maintenance_loop())
