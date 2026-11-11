@@ -20,7 +20,7 @@ Render等のWebサービスで動かす場合:
   !janken グー          文字でも出せるよ（グー / チョキ / パー）。/janken は手の選択肢つき
   !omikuji / /omikuji   おみくじ
   !game / /game         ゲームのリンクを送るよ（!リンク でもOK、「ゲーム」って言っても送るよ）
-  !spamlog / !log / /spamlog / /log   ログの最新10件を見る（管理者向け）
+  !log / /log           ログの最新10件を見る（管理者向け）
   !help_mimi / /help_mimi ヘルプ
 会話はメンション、DM、文に「みみ」を含めると返事するよ。
 サーバー内では全ての投稿を1通ごとにログに記録するよ。スパムっぽい投稿（連投・同じ文の
@@ -406,6 +406,16 @@ async def check_and_log_spam(message: discord.Message) -> bool:
         f"・投稿: {message.jump_url}",
         exclude_channel_id=message.channel.id,
     )
+
+    # 監視ワードのときは、そのチャンネルで本人に警告も出す
+    m = re.search(r"監視ワード「(.+?)」を検知", reason)
+    if m:
+        try:
+            await message.channel.send(
+                f"⚠️ {message.author.mention} 警告だよ！「{m.group(1)}」は使っちゃダメな言葉だよ。この投稿はログに記録したからね。"
+            )
+        except discord.HTTPException:
+            pass
     return True
 
 
@@ -519,7 +529,7 @@ async def omikuji(ctx: commands.Context):
     await ctx.send(f"🎋 {ctx.author.display_name} のおみくじは **{result}**！{comments.get(result, 'いい日になる予感だよ♪')}")
 
 
-def spamlog_text(guild_name: str) -> str:
+def log_text(guild_name: str) -> str:
     """ログの表示テキスト（!版と /版で共用）。"""
     entries = [e for e in log_entries if e["guild"] == guild_name][-10:]
     if not entries:
@@ -536,16 +546,16 @@ def spamlog_text(guild_name: str) -> str:
     return "\n".join(lines)
 
 
-@bot.command(name="spamlog", aliases=["log"])
-async def spamlog(ctx: commands.Context):
-    """!spamlog / !log : ログの最新10件（メッセージ管理権限のある人だけ）"""
+@bot.command(name="log")
+async def log_cmd(ctx: commands.Context):
+    """!log : ログの最新10件（メッセージ管理権限のある人だけ）"""
     if ctx.guild is None:
         await ctx.send("ログはサーバーの中で見てね。")
         return
     if not (isinstance(ctx.author, discord.Member) and ctx.author.guild_permissions.manage_messages):
         await ctx.send("ログはサーバーの管理者だけが見られるよ。")
         return
-    await ctx.send(spamlog_text(ctx.guild.name))
+    await ctx.send(log_text(ctx.guild.name))
 
 
 @bot.command(name="help_mimi")
@@ -601,18 +611,7 @@ async def slash_log(interaction: discord.Interaction):
     if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_messages):
         await interaction.response.send_message("ログはサーバーの管理者だけが見られるよ。", ephemeral=True)
         return
-    await interaction.response.send_message(spamlog_text(interaction.guild.name), ephemeral=True)
-
-
-@bot.tree.command(name="spamlog", description="ログの最新10件を見る（管理者向け）")
-async def slash_spamlog(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("スパムログはサーバーの中で見てね。", ephemeral=True)
-        return
-    if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_messages):
-        await interaction.response.send_message("スパムログはサーバーの管理者だけが見られるよ。", ephemeral=True)
-        return
-    await interaction.response.send_message(spamlog_text(interaction.guild.name), ephemeral=True)
+    await interaction.response.send_message(log_text(interaction.guild.name), ephemeral=True)
 
 
 HELP_TEXT = (
@@ -621,7 +620,7 @@ HELP_TEXT = (
     "✊ `!janken` / `/janken` : じゃんけん対決（ボタン or 手の選択肢、スコア記録あり）\n"
     "🎋 `!omikuji` / `/omikuji` : おみくじ\n"
     "🎮 `!game` / `/game` : ゲームのリンクを送るよ（`!リンク` でもOK、「ゲーム」って言っても送るよ）\n"
-    "📝 ログ: サーバーの投稿は1通ごとに全部ログに記録してるよ（スパムっぽいものは🚨検知つき）。管理者は `!log` / `/log` で確認\n"
+    "📝 ログ: サーバーの投稿は1通ごとに全部ログに記録してるよ（スパムっぽいものは🚨検知つき、監視ワードを見たらその場で警告もするよ）。管理者は `!log` / `/log` で確認\n"
     "👋 `!hello` / `/hello` : あいさつ"
 )
 
