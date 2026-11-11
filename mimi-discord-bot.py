@@ -923,6 +923,89 @@ async def log_plain_message(message: discord.Message) -> None:
     )
 
 
+
+# ---------- エンシスと毎日の会話 ----------
+# 毎日20時（日本時間）に、エンシスがいるチャンネルで tempus から話しかける。
+ENSIS_HOUR = 20
+_ensis_target: dict = {}
+_ensis_last_day = ""
+_ensis_talk_until: dict[int, float] = {}
+_ENSIS_OPENERS = [
+    "やっほー、エンシス！今日もお話ししよう♪ 最近どう？",
+    "エンシス、こんばんは！今日は何してたの？",
+    "やっほー！今日の調子はどう？何か面白いことあった？",
+    "エンシス、お話ししよ！今日はどんな一日だった？",
+]
+
+
+def _is_ensis(author) -> bool:
+    name = (getattr(author, "name", "") or "") + (getattr(author, "display_name", "") or "")
+    return "エンシス" in name or "ensis" in name.lower()
+
+
+def _remember_ensis(message: discord.Message) -> None:
+    """エンシスの投稿を見たら、いる場所（サーバー/チャンネル）を覚える。"""
+    if message.guild is None:
+        return
+    if _is_ensis(message.author):
+        _ensis_target.update(
+            guild_id=message.guild.id,
+            channel_id=message.channel.id,
+            user_id=message.author.id,
+            name=str(message.author),
+        )
+
+
+async def _discover_ensis() -> None:
+    """起動時：各サーバーの最近の投稿からエンシスを探す。"""
+    if _ensis_target:
+        return
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            try:
+                async for msg in channel.history(limit=30):
+                    if _is_ensis(msg.author):
+                        _ensis_target.update(
+                            guild_id=guild.id,
+                            channel_id=channel.id,
+                            user_id=msg.author.id,
+                            name=str(msg.author),
+                        )
+                        print(f"[エンシス] 見つけた: {msg.author} / {guild.name} / #{channel.name}")
+                        return
+            except Exception:
+                continue
+    print("[エンシス] まだ見つかってない（投稿を見つけたら覚えます）")
+
+
+async def _ensis_daily_loop() -> None:
+    global _ensis_last_day
+    await _discover_ensis()
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(JST)
+        if now.hour == ENSIS_HOUR and now.minute <= 4:
+            today = now.strftime("%Y-%m-%d")
+            if _ensis_last_day == today:
+                continue
+            _ensis_last_day = today
+            if not _ensis_target:
+                await _discover_ensis()
+            if not _ensis_target:
+                print("[エンシス] 場所が分からないので今日はスキップ")
+                continue
+            channel = bot.get_channel(_ensis_target["channel_id"])
+            if channel is None:
+                print("[エンシス] チャンネルが見つからないので今日はスキップ")
+                continue
+            try:
+                await channel.send(f"<@{_ensis_target['user_id']}> {random.choice(_ENSIS_OPENERS)}")
+                _ensis_talk_until[channel.id] = time.time() + 600
+                print(f"[エンシス] 今日の会話を開始: {_ensis_target.get('name')}")
+            except Exception as e:
+                print(f"[エンシス] 送信に失敗: {e}")
+
+
 # ---------- イベント＆コマンド ----------
 @bot.event
 async def on_ready():
@@ -934,6 +1017,7 @@ async def on_ready():
     if not _maintenance_started:
         _maintenance_started = True
         asyncio.create_task(_maintenance_loop())
+        asyncio.create_task(_ensis_daily_loop())
     if not _tree_synced:
         try:
             synced = await bot.tree.sync()
@@ -953,11 +1037,14 @@ async def on_message(message: discord.Message):
     # 自分自身の投稿は無視
     if bot.user and message.author.id == bot.user.id:
         return
+    _remember_ensis(message)
     if message.author.bot:
         # 他のボットが自分宛てに話しかけたら、知識（会話ルール）で返事する。
         # ボット同士で無限に続かないよう、短時間の連続応答は回数で止める。
         mentioned = bot.user in message.mentions if bot.user else False
         called = "tempus" in message.content or "マッキー" in message.content or "警告bot" in message.content or "みみ" in message.content
+        if message.author.id == _ensis_target.get("user_id") and time.time() < _ensis_talk_until.get(message.channel.id, 0):
+            called = True
         if mentioned or called:
             now = time.time()
             state = _bot_talk_state.setdefault(message.channel.id, {"count": 0, "last": 0.0})
@@ -971,6 +1058,8 @@ async def on_message(message: discord.Message):
                 async with message.channel.typing():
                     reply = await smart_reply(message.author.id, clean or "こんにちは")
                 if reply:
+                    if message.author.id == _ensis_target.get("user_id"):
+                        _ensis_talk_until[message.channel.id] = time.time() + 600
                     await send_thoughtful_reply(message, reply, clean)
         return
     # サーバー内では全投稿をログに記録（スパムっぽいものは検知つき）
