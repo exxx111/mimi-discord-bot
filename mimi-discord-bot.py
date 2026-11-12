@@ -410,7 +410,7 @@ def _system_prompt(user_id: int | None = None) -> str:
         + "ユーザーの発言に【調べた情報】が付いていたら、その情報をもとに具体的に答えてください（数字や固有名詞は情報のものをそのまま使う）。観測データ（サーバーの会話ログの集計）が付いていたら、第三者目線で客観的に、数字をもとに分析して答えてください。"
         + "ゲームのアップデート情報のときは、最初に「アップデート名（日付）」、次にコードがあれば「コード名：報酬」を箇条書き、新ユニット、新要素の順で、短い箇条書き中心にまとめてください。情報に無いコードやユニット名は絶対に作らないでください。"
         + "フォートナイトの情報が付いていたら、最初に現在のバージョンと最新ニュース、次に次のアプデ予定、次におすすめの降り場（地名リストの中から、激戦区と安定降りを理由つきで1つずつ）、強い武器（武器プールの中からだけ選ぶ）、有利な立ち回り（序盤・中盤・終盤）の順で答えてください。情報に無いバージョン・日付・武器名・地名は作らないでください。予定やリークの話は、公式確定ではないと分かるように書いてください。"
-        + "アニメアドベンチャーの情報が付いていたら、【最新アプデ】【新ユニット】【コード】【次回アプデ】の見出しに分けて答えてください。キャラの情報が付いていたら【キャラ詳細】【覚醒（進化）素材】【素材の入手先】に分けて答えてください。情報に無いユニット名・素材・入手先は作らないでください。"
+        + "アニメアドベンチャーの情報が付いていたら、【最新アプデ】【新ユニット】【コード】【次回アプデ】の見出しに分けて答えてください。キャラの情報が付いていたら【キャラ詳細】【覚醒（進化）素材】【素材の入手先】に分けて答えてください。情報に無いユニット名・素材・入手先は作らないでください。材料の中に「複数サイトで一致（確認済み）」とある情報は確認済みとして伝え、1つのサイトだけの情報はそのサイト名を添えてください。"
         + "調べた情報が付いていない最新ニュースや天気は、知らないと正直に言ってください。"
         + (
             _LANG_INSTRUCTIONS[user_langs[user_id]]
@@ -1597,6 +1597,60 @@ def _aa_new_units() -> str:
     return plain[m.start():m.start() + 1500]
 
 
+def _aa_codes_crosscheck(wiki_codes_text: str) -> str:
+    """コードを海外サイトBeebomと照合し、一致・単独を分けて返す。"""
+    try:
+        page = _http_get_text("https://www.beebom.com/anime-adventures-codes/", timeout=12)
+    except Exception as e:
+        print(f"[調べもの] AAコード照合に失敗: {e}", flush=True)
+        return ""
+    plain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S))
+    plain = re.sub(r"\s+", " ", plain)
+    i = plain.find("All Working Anime Adventures Codes")
+    seg = plain[i:i + 800] if i >= 0 else ""
+    if i >= 0:
+        # 期限切れコード欄が混ざらないよう、Expiredの手前で切る
+        j = seg.find("Expired")
+        if j > 100:
+            seg = seg[:j]
+    if not seg:
+        return ""
+
+    def codes_of(s: str) -> list[str]:
+        out: list[str] = []
+        for c in re.findall(r"\b[A-Z][A-Z0-9]{4,}\b", s):
+            if c not in out and c not in ("NEW",):
+                out.append(c)
+        return out
+
+    wiki_codes = codes_of(wiki_codes_text)
+    bee_codes = codes_of(seg)
+    both = [c for c in bee_codes if c in wiki_codes]
+    lines = ["コードの複数サイト確認（Wiki＋Beebom）:"]
+    if both:
+        lines.append("・複数サイトで一致（確認済み）: " + "、".join(both[:8]))
+    only = [c for c in bee_codes if c not in wiki_codes]
+    if only:
+        lines.append("・Beebomのみ掲載: " + "、".join(only[:5]))
+    lines.append("Beebomのコード欄（英語）:\n" + seg)
+    return "\n".join(lines)
+
+
+def _aa_event_info() -> str:
+    """英語サイトの夏イベント（UPD 21）ガイドから要点を取る。"""
+    try:
+        page = _http_get_text("https://tierlistanimeadventures.com/guides/anime-adventures-summer-event/", timeout=12)
+    except Exception as e:
+        print(f"[調べもの] AAイベント取得に失敗: {e}", flush=True)
+        return ""
+    plain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S))
+    plain = re.sub(r"\s+", " ", plain)
+    i = plain.find("The summer event")
+    if i < 0:
+        return ""
+    return "夏イベント情報（英語サイト）:\n" + plain[i:i + 1000]
+
+
 def _aa_context(text: str) -> str:
     """アニメアドベンチャーの情報・アプデ・次回アプデ用の調べもの材料を集める。"""
     parts = []
@@ -1611,6 +1665,12 @@ def _aa_context(text: str) -> str:
         i = codes.lower().find("active")
         seg = codes[i:i + 1100] if i >= 0 else codes[:1100]
         parts.append("Wikiのコードページ（英語）:\n" + seg)
+        cc = _aa_codes_crosscheck(codes[i:i + 1600] if i >= 0 else codes[:1600])
+        if cc:
+            parts.append(cc)
+    ev = _aa_event_info()
+    if ev:
+        parts.append(ev)
     uq = _aa_unit_query(text)
     if uq:
         titles = [t for t in _aa_search(uq) if not any(s in t for s in _AA_SKIP_TITLES)]
