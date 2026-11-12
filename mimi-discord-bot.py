@@ -1847,13 +1847,8 @@ async def on_message(message: discord.Message):
             if _report_user_id != message.author.id:
                 _report_user_id = message.author.id
                 print(f"[監視レポート] 通知先を覚えた: {message.author}")
-            if not _restart_notice_sent:
-                _restart_notice_sent = True
-                try:
-                    dm = await message.author.create_dm()
-                    await dm.send(f"🕐 tempusの次の定期再起動は {_next_restart_text()} 頃だよ。その瞬間だけ数十秒〜1分くらいオフラインになるよ。")
-                except Exception as e:
-                    print(f"[再起動] 予定時刻のDM送信に失敗: {e}", flush=True)
+            # 再起動時刻の単独DMは送らない（会話のたびに出てしまうため）。
+            # 時刻は21時の監視レポートの中でのみ知らせる。
         clean = message.content
         if bot.user:
             clean = clean.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
