@@ -925,6 +925,9 @@ def _game_update_lookup(text: str) -> str:
             if k in text:
                 eng = v
                 break
+    if not eng and title in ("", "ゲーム"):
+        eng = "Anime Vanguards"
+        title = "アニメヴェンカード"
     parts = []
     info = _roblox_game_info(eng or title)
     if info:
@@ -984,6 +987,10 @@ def _fixed_update_reply(text: str) -> str | None:
                 eng = v
                 title = k
                 break
+    if not eng and title in ("", "ゲーム"):
+        # ゲーム名なしで聞かれたら、いつものゲーム（アニメヴェンカード）の話として答える
+        eng = "Anime Vanguards"
+        title = "アニメヴェンカード"
     if not eng or eng not in _GAME_GUIDES:
         return None
     subtitle = ""
