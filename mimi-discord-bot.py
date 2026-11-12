@@ -410,7 +410,7 @@ def _system_prompt(user_id: int | None = None) -> str:
         + "ユーザーの発言に【調べた情報】が付いていたら、その情報をもとに具体的に答えてください（数字や固有名詞は情報のものをそのまま使う）。観測データ（サーバーの会話ログの集計）が付いていたら、第三者目線で客観的に、数字をもとに分析して答えてください。"
         + "ゲームのアップデート情報のときは、最初に「アップデート名（日付）」、次にコードがあれば「コード名：報酬」を箇条書き、新ユニット、新要素の順で、短い箇条書き中心にまとめてください。情報に無いコードやユニット名は絶対に作らないでください。"
         + "フォートナイトの情報が付いていたら、最初に現在のバージョンと最新ニュース、次に次のアプデ予定、次におすすめの降り場（地名リストの中から、激戦区と安定降りを理由つきで1つずつ）、強い武器（武器プールの中からだけ選ぶ）、有利な立ち回り（序盤・中盤・終盤）の順で答えてください。情報に無いバージョン・日付・武器名・地名は作らないでください。予定やリークの話は、公式確定ではないと分かるように書いてください。"
-        + "アニメアドベンチャーの情報が付いていたら、【最新アプデ】【新ユニット】【コード】【次回アプデ】の見出しに分けて答えてください。キャラの情報が付いていたら【キャラ詳細】【覚醒（進化）素材】【素材の入手先】に分けて答えてください。情報に無いユニット名・素材・入手先は作らないでください。材料の中に「複数サイトで一致（確認済み）」とある情報は確認済みとして伝え、1つのサイトだけの情報はそのサイト名を添えてください。"
+        + "アニメアドベンチャーの情報が付いていたら、【最新アプデ】【新ユニット】【コード】【次回アプデ】の見出しに分けて答えてください。キャラの情報が付いていたら【キャラ詳細】【覚醒（進化）素材】【素材の入手先】に分けて答えてください。情報に無いユニット名・素材・入手先は作らないでください。材料の中に「複数サイトで一致（確認済み）」とある情報は確認済みとして伝え、1つのサイトだけの情報はそのサイト名を添えてください。「未確認」と付いたユニットや「前回取得データ」と付いた情報は、その旨を添えて断定しないでください。各サイトの更新日が材料にあれば、古さが分かるよう日付も添えてください。"
         + "調べた情報が付いていない最新ニュースや天気は、知らないと正直に言ってください。"
         + (
             _LANG_INSTRUCTIONS[user_langs[user_id]]
@@ -1068,7 +1068,15 @@ def _roblox_game_info(title: str) -> str:
     try:
         uid = _GAME_UNIVERSES.get(title)
         if uid:
-            g = _http_get_json(f"https://games.roblox.com/v1/games?universeIds={uid}")
+            g = None
+            for _attempt in range(2):  # タイムアウト対策に1回だけ再試行する
+                try:
+                    g = _http_get_json(f"https://games.roblox.com/v1/games?universeIds={uid}", timeout=10)
+                    break
+                except Exception:
+                    g = None
+            if not g:
+                raise TimeoutError("roblox api retry failed")
             gd = (g.get("data") or [{}])[0]
             if gd:
                 lines = [
@@ -1506,6 +1514,74 @@ def _aa_material_source(name: str) -> str:
     return ""
 
 
+# ---- 情報の確実さ向上（A照合 / B日付 / C前回データ） ----
+_AA_CACHE: dict[str, tuple[str, float]] = {}
+
+
+def _aa_cached(key: str, producer) -> tuple[str, bool]:
+    """producer()で取得できればキャッシュして返す。失敗したら前回データを stale=True で返す。"""
+    try:
+        v = producer()
+    except Exception:
+        v = ""
+    if v:
+        _AA_CACHE[key] = (v, time.time())
+        return v, False
+    if key in _AA_CACHE:
+        return _AA_CACHE[key][0], True
+    return "", False
+
+
+def _aa_stale_note(stale_keys: list[str]) -> str:
+    """前回データを使った項目があれば、その旨と取得日時を返す。"""
+    stamps = []
+    for k in stale_keys:
+        if k in _AA_CACHE:
+            dt = datetime.fromtimestamp(_AA_CACHE[k][1], JST)
+            stamps.append(dt.strftime("%m/%d %H:%M"))
+    if not stamps:
+        return ""
+    return f"※一部は前回取得データ（{stamps[0]}取得）"
+
+
+_AA_VERIFIED: set[str] = set()
+_AA_UNVERIFIED: set[str] = set()
+
+
+def _aa_unit_verified(name: str) -> bool:
+    """ユニットが実在するか照合する（A: 照合強化）。ティアリストサイトの専用ページ、またはWikiの同名ページがあれば確認済み。結果はプロセス内キャッシュ。
+    ※UPD 21のユニットはWiki側の反映が遅れていてWikiでは確認できないことがある。"""
+    if name in _AA_VERIFIED:
+        return True
+    if name in _AA_UNVERIFIED:
+        return False
+    ok = False
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if slug:
+        try:
+            page = _http_get_text(f"https://tierlistanimeadventures.com/units/anime-adventures-{slug}/", timeout=8)
+            ok = name in page
+        except Exception:
+            ok = False
+    if not ok:
+        titles = _aa_search(name)
+        ok = any(t.lower() == name.lower() or t.lower().startswith(name.lower() + " (") for t in titles)
+    (_AA_VERIFIED if ok else _AA_UNVERIFIED).add(name)
+    return ok
+
+
+def _aa_group_shout() -> str:
+    """公式Robloxグループ「Gomu」の告知（シャウト）。公式Discordの発表と並ぶ公式情報。"""
+    try:
+        d = _http_get_json("https://groups.roblox.com/v1/groups/10611639", timeout=8)
+    except Exception:
+        return ""
+    body = ((d.get("shout") or {}).get("body") or "").strip()
+    if not body:
+        return ""
+    return "公式グループGomuの告知:\n" + body[:300]
+
+
 def _aa_unit_reply(text: str) -> str | None:
     """キャラ名から、詳細・覚醒素材・素材の入手先を分けた固定形式の返事を作る。"""
     query = _aa_unit_query(text)
@@ -1590,15 +1666,48 @@ def _aa_unit_reply(text: str) -> str | None:
     return out
 
 
+_AA_UNITS_STALE = False
+
+
+def _month_num(name: str) -> int:
+    for k, v in _MONTHS.items():
+        if k == name or k.startswith(name):
+            return v
+    return 0
+
+
+def _aa_units_plain() -> str:
+    """ティアリストサイトのユニット一覧ページ全文（前回データのキャッシュ付き）。"""
+    global _AA_UNITS_STALE
+
+    def fetch() -> str:
+        page = _http_get_text("https://tierlistanimeadventures.com/units/", timeout=12)
+        plain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S))
+        return re.sub(r"\s+", " ", plain)
+
+    txt, stale = _aa_cached("units_plain", fetch)
+    _AA_UNITS_STALE = stale
+    if not txt:
+        print("[調べもの] AA新ユニット取得に失敗", flush=True)
+    return txt
+
+
+def _aa_units_date() -> str:
+    """ティアリストサイトの更新日（例: 11月8日）。"""
+    plain = _aa_units_plain()
+    m = re.search(r"Updated ([A-Z][a-z]+) (\d+), (\d{4})", plain)
+    if m:
+        mo = _month_num(m.group(1))
+        if mo:
+            return f"{mo}月{m.group(2)}日"
+    return ""
+
+
 def _aa_new_units(seg_len: int = 1500) -> str:
     """英語ティアリストサイトの「New UPD ○ units」欄から新ユニット情報を取る。"""
-    try:
-        page = _http_get_text("https://tierlistanimeadventures.com/units/", timeout=12)
-    except Exception as e:
-        print(f"[調べもの] AA新ユニット取得に失敗: {e}", flush=True)
+    plain = _aa_units_plain()
+    if not plain:
         return ""
-    plain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S))
-    plain = re.sub(r"\s+", " ", plain)
     m = re.search(r"New UPD [0-9.]+ units", plain)
     if not m:
         return ""
@@ -1634,7 +1743,13 @@ def _aa_codes_crosscheck(wiki_codes_text: str) -> str:
     wiki_codes = codes_of(wiki_codes_text)
     bee_codes = codes_of(seg)
     both = [c for c in bee_codes if c in wiki_codes]
-    lines = ["コードの複数サイト確認（Wiki＋Beebom）:"]
+    bee_date = ""
+    md = re.search(r"Updated: ([A-Z][a-z]+) (\d+),", plain)
+    if md:
+        mo = _month_num(md.group(1))
+        if mo:
+            bee_date = f"{mo}月{md.group(2)}日"
+    lines = ["コードの複数サイト確認（Wiki＋Beebom" + (f"／Beebom {bee_date}更新" if bee_date else "") + "）:"]
     if both:
         lines.append("・複数サイトで一致（確認済み）: " + "、".join(both[:8]))
     only = [c for c in bee_codes if c not in wiki_codes]
@@ -1667,12 +1782,12 @@ def _aa_update_reply() -> str | None:
         for tier, name, role in re.findall(r"\b([SAB]) ((?:[A-Z][A-Za-z]+)(?: [A-Z][A-Za-z]+){0,2}) (Damage|Support)\b", seg):
             if name not in [c[1] for c in cards]:
                 cards.append((tier, name, role))
-    codes_txt = _aa_page_text("Codes")
+    codes_txt, codes_stale = _aa_cached("codes_page", lambda: _aa_page_text("Codes"))
     active_seg = ""
     if codes_txt:
         i = codes_txt.lower().find("active")
         active_seg = codes_txt[i:i + 1600] if i >= 0 else codes_txt[:1600]
-    cc = _aa_codes_crosscheck(active_seg) if active_seg else ""
+    cc, cc_stale = _aa_cached("crosscheck", lambda: _aa_codes_crosscheck(active_seg) if active_seg else "")
     both: list[str] = []
     only_bee: list[str] = []
     rewards: dict[str, str] = {}
@@ -1707,7 +1822,8 @@ def _aa_update_reply() -> str | None:
         role_jp = {"Damage": "攻撃", "Support": "支援"}
         lines.append(f"【新ユニット】{len(cards)}体＋シークレット3体")
         for tier, name, role in cards:
-            lines.append(f"・{name}（{tier}ランク／{role_jp.get(role, role)}）")
+            mark = "" if _aa_unit_verified(name) else "（他サイト未確認）"
+            lines.append(f"・{name}（{tier}ランク／{role_jp.get(role, role)}）{mark}")
         if seg:
             m = re.search(r"Summer banner has three Featured Mythics: ([^.]+)\.", seg)
             if m:
@@ -1749,7 +1865,18 @@ def _aa_update_reply() -> str | None:
                 nxt = re.sub(r"\s*\(https?://.*$", "", ln).strip("・ ")[:120]
                 break
     lines.append("【次回アプデ】" + (nxt if nxt else "海外サイトでもまだ日程は出てない"))
-    lines.append("情報元: Roblox公式・海外Wiki・英語ティアリストサイト・Beebom")
+    stale_keys = (["codes_page"] if codes_stale else []) + (["crosscheck"] if cc_stale else []) + (["units_plain"] if _AA_UNITS_STALE else [])
+    note = _aa_stale_note(stale_keys)
+    if note:
+        lines.append(note)
+    dates = []
+    ud = _aa_units_date()
+    if ud:
+        dates.append(f"ティアリスト{ud}更新")
+    mb = re.search(r"Beebom (\d+月\d+日)更新", cc or "")
+    if mb:
+        dates.append(f"Beebom {mb.group(1)}更新")
+    lines.append("情報元: Roblox公式・海外Wiki・英語ティアリストサイト・Beebom" + (f"（{'・'.join(dates)}）" if dates else ""))
     out = "\n".join(lines)
     return out if len(out) <= 980 else out[:970] + "…"
 
@@ -1757,23 +1884,50 @@ def _aa_update_reply() -> str | None:
 def _aa_context(text: str) -> str:
     """アニメアドベンチャーの情報・アプデ・次回アプデ用の調べもの材料を集める。"""
     parts = []
-    info = _roblox_game_info("Anime Adventures")
+    stale_keys: list[str] = []
+    info, info_stale = _aa_cached("roblox_aa", lambda: _roblox_game_info("Anime Adventures"))
     if info:
         parts.append(info)
+    if info_stale:
+        stale_keys.append("roblox_aa")
+    shout = _aa_group_shout()
+    if shout:
+        parts.append(shout)
     units = _aa_new_units()
     if units:
-        parts.append("新ユニット情報（英語サイト）:\n" + units)
-    codes = _aa_page_text("Codes")
+        ud = _aa_units_date()
+        label = f"新ユニット情報（英語サイト／{ud}更新）" if ud else "新ユニット情報（英語サイト）"
+        parts.append(label + ":\n" + units)
+        names = []
+        for _tier, name, _role in re.findall(r"\b([SAB]) ((?:[A-Z][A-Za-z]+)(?: [A-Z][A-Za-z]+){0,2}) (Damage|Support)\b", units):
+            if name not in names:
+                names.append(name)
+        if names:
+            ok = [n for n in names if _aa_unit_verified(n)]
+            ng = [n for n in names if n not in ok]
+            line = "ユニット照合: 専用ページ等で確認できた: " + "、".join(ok)
+            if ng:
+                line += "／確認できなかった: " + "、".join(ng)
+            parts.append(line)
+    if _AA_UNITS_STALE:
+        stale_keys.append("units_plain")
+    codes, codes_stale = _aa_cached("codes_page", lambda: _aa_page_text("Codes"))
+    if codes_stale:
+        stale_keys.append("codes_page")
     if codes:
         i = codes.lower().find("active")
         seg = codes[i:i + 1100] if i >= 0 else codes[:1100]
         parts.append("Wikiのコードページ（英語）:\n" + seg)
-        cc = _aa_codes_crosscheck(codes[i:i + 1600] if i >= 0 else codes[:1600])
+        cc, cc_stale = _aa_cached("crosscheck", lambda: _aa_codes_crosscheck(codes[i:i + 1600] if i >= 0 else codes[:1600]))
+        if cc_stale:
+            stale_keys.append("crosscheck")
         if cc:
             parts.append(cc)
-    ev = _aa_event_info()
+    ev, ev_stale = _aa_cached("event_info", _aa_event_info)
     if ev:
         parts.append(ev)
+    if ev_stale:
+        stale_keys.append("event_info")
     uq = _aa_unit_query(text)
     if uq:
         titles = [t for t in _aa_search(uq) if not any(s in t for s in _AA_SKIP_TITLES)]
@@ -1791,6 +1945,9 @@ def _aa_context(text: str) -> str:
             kept = [ln for ln in r.split("\n") if "Anime Adventures" in ln or "UPD 2" in ln]
             if kept:
                 parts.append(f"Web検索「{q}」:\n" + "\n".join(kept[:6]))
+    note = _aa_stale_note(stale_keys)
+    if note:
+        parts.append(note)
     return "\n\n".join(parts)
 
 
