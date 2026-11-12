@@ -948,6 +948,8 @@ def _lookup_context(text: str) -> tuple[str, str]:
     """発言内容を見て、必要な調べものを実行し (種類, 結果テキスト) を返す。"""
     if "アプデ" in text or "アップデート" in text:
         return "アプデ情報", _game_update_lookup(text)
+    if any(k in text for k in _GAME_ALIASES) and any(w in text for w in ("最新", "情報", "コード")):
+        return "アプデ情報", _game_update_lookup(text)
     if "天気" in text:
         place = re.sub(r"(天気|予報|調べて|教えて|知りたい|今日|明日|明後日|現在|今|の|は|って|どう|かな|を|に|！|!|？|\?|。|、|\s)", "", text)
         if not place or len(place) > 10:
