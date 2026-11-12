@@ -859,6 +859,45 @@ def _roblox_game_info(title: str) -> str:
         return ""
 
 
+# 英語の攻略・コードまとめサイト（ゲームページにコード表と最新アプデ記事がある）
+_GAME_GUIDES = {
+    "Anime Vanguards": "https://bloxguidesgg.com/games/anime-vanguards",
+}
+
+
+def _game_guide_lookup(eng: str) -> list[str]:
+    """英語のガイドサイトから、コード表と最新アプデ記事（新ユニット等）を持ってくる。"""
+    url = _GAME_GUIDES.get(eng)
+    if not url:
+        return []
+    parts = []
+    try:
+        page = _http_get_text(url, timeout=12)
+    except Exception as e:
+        print(f"[調べもの] ガイドサイトの取得に失敗: {e}")
+        return parts
+    plain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S))
+    plain = re.sub(r"\s+", " ", plain)
+    m2 = re.search(r"Latest [\w ]{0,40}Codes", plain) or re.search(r"Code ?Reward", plain)
+    if m2:
+        parts.append("コード一覧（英語サイト）: " + plain[m2.start():m2.start() + 1100])
+    m = re.search(r'href="(/blog/[^"]*update[^"]*)"', page)
+    if m:
+        try:
+            art = _http_get_text("https://bloxguidesgg.com" + m.group(1), timeout=12)
+            aplain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", art, flags=re.S))
+            aplain = re.sub(r"\s+", " ", aplain)
+            occ = [mm.start() for mm in re.finditer(r"Every new unit", aplain)]
+            j = occ[1] if len(occ) >= 2 else (occ[0] if occ else -1)
+            if j < 0:
+                j = aplain.find("Unit Rarity")
+            if j >= 0:
+                parts.append("最新アプデの新ユニット（英語サイト）: " + aplain[j:j + 1500])
+        except Exception as e:
+            print(f"[調べもの] アプデ記事の取得に失敗: {e}")
+    return parts
+
+
 def _game_update_lookup(text: str) -> str:
     """ゲームの最新アップデート情報を、Roblox公式情報＋Web検索で集める。"""
     title = text
@@ -875,6 +914,8 @@ def _game_update_lookup(text: str) -> str:
     info = _roblox_game_info(eng or title)
     if info:
         parts.append(info)
+    if eng:
+        parts.extend(_game_guide_lookup(eng))
     name_for_search = eng or title
     for q in (f'"{name_for_search}" update', f"{name_for_search} アップデート 最新"):
         r = _web_search(q)
