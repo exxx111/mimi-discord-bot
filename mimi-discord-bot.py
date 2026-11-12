@@ -103,6 +103,12 @@ _started_at = time.time()
 _maintenance_started = False
 
 
+def _next_restart_text() -> str:
+    """次の自動再起動の予定時刻（日本時間）を「○月○日 HH:MM」で返す。"""
+    t = datetime.fromtimestamp(_started_at + RESTART_AFTER, JST)
+    return f"{t.month}月{t.day}日 {t:%H:%M}"
+
+
 def _self_ping() -> None:
     try:
         req = urllib.request.Request(SELF_URL, headers={"User-Agent": "mimi-keepalive"})
@@ -1015,7 +1021,7 @@ def _detect_spam(message: discord.Message) -> str | None:
     norm_text = _normalize(content)
     for w in WATCH_WORDS:
         if w in norm_text:
-            return f"監視ワード「{w}」を検知"
+            return f"暴言（監視ワード「{w}」）を検知"
     for e in WATCH_EMOJIS:
         if e in content:
             return f"監視絵文字「{e}」を検知"
@@ -1264,6 +1270,7 @@ _member_channels: dict[tuple[int, int], list] = defaultdict(list)
 _member_alerted: dict[tuple[int, int], float] = {}
 _join_times: dict[int, list[float]] = defaultdict(list)
 _join_alerted: dict[int, float] = {}
+_profanity_hits: dict[int, list[float]] = defaultdict(list)
 
 
 async def _alert_owner_dm(text: str) -> None:
@@ -1352,13 +1359,30 @@ async def check_and_log_spam(message: discord.Message) -> bool:
         exclude_channel_id=message.channel.id,
     )
 
-    # 監視ワードのときは、そのチャンネルで本人に警告も出す
-    m = re.search(r"監視ワード「(.+?)」を検知", reason)
+    # 監視ワード（暴言）のときは、そのチャンネルで本人に警告も出す（回数つき・繰り返すと管理者へ通知）
+    m = re.search(r"暴言（監視ワード「(.+?)」）を検知", reason)
     if m:
+        now_ts = time.time()
+        hits = [t for t in _profanity_hits[message.author.id] if now_ts - t <= 24 * 3600]
+        hits.append(now_ts)
+        _profanity_hits[message.author.id] = hits
+        count = len(hits)
         try:
-            await message.channel.send(
-                f"⚠️ {message.author.mention} 警告だよ！「{m.group(1)}」は使っちゃダメな言葉だよ。この投稿はログに記録したからね。"
-            )
+            if count == 1:
+                await message.channel.send(
+                    f"⚠️ {message.author.mention} 警告だよ！「{m.group(1)}」は暴言だよ。使っちゃダメだよ。この投稿はログに記録したからね。"
+                )
+            elif count == 2:
+                await message.channel.send(
+                    f"⚠️ {message.author.mention} 警告（2回目）だよ！「{m.group(1)}」は暴言だよ。次にまた言ったら管理者に通知するからね。"
+                )
+            else:
+                await message.channel.send(
+                    f"🚨 {message.author.mention} 警告（{count}回目）だよ！暴言を繰り返しているので、管理者に通知しました。"
+                )
+                await _alert_owner_dm(
+                    f"🚨 暴言の繰り返し通知\n{message.author} さんが24時間以内に {count} 回目の暴言を投稿しました。\n・言葉: 「{m.group(1)}」\n・場所: #{getattr(message.channel, 'name', '')}（{message.guild}）\n・内容: {entry['content'][:100]}\n・投稿: {message.jump_url}"
+                )
         except discord.HTTPException:
             pass
     return True
@@ -1473,6 +1497,7 @@ async def _ensis_daily_loop() -> None:
 # 異常があった日だけ、通知先の人にDMで知らせる。異常なしの日は送らない。
 REPORT_HOUR = 21
 _report_user_id: int | None = None
+_restart_notice_sent = False
 _report_since: datetime | None = None
 _report_last_day = ""
 
@@ -1504,6 +1529,7 @@ async def _daily_report_loop() -> None:
         ]
         for e in flagged[-10:]:
             lines.append(f"・[{e['time']:%H:%M}] {e['user']} ＠{e['channel']}（{e['guild']}）: {e['content'][:50]}（{e['reason']}）")
+        lines.append(f"🕐 次の定期再起動は {_next_restart_text()} 頃です（その瞬間だけ数十秒オフラインになります）")
         text = "\n".join(lines)
         targets: set[int] = set()
         if _report_user_id:
@@ -1528,6 +1554,7 @@ async def _daily_report_loop() -> None:
 async def on_ready():
     global _tree_synced, _maintenance_started
     print(f"ログインしました: {bot.user} / tempusボット起動OK")
+    print(f"[再起動] 次の自動再起動は {_next_restart_text()} 頃です", flush=True)
     print('AI連携: ' + ('Groq' if GROQ_API_KEY else 'Gemini' if GEMINI_API_KEY else 'OFF（ルール返信）'))
     guild_names = " / ".join(g.name for g in bot.guilds) or "なし"
     print(f"参加中のサーバー（{len(bot.guilds)}件）: {guild_names}", flush=True)
@@ -1629,11 +1656,18 @@ async def on_message(message: discord.Message):
     mentioned = bot.user in message.mentions if bot.user else False
     called = "tempus" in message.content or "マッキー" in message.content or "警告bot" in message.content or "みみ" in message.content
     if is_dm or mentioned or called:
-        global _report_user_id
+        global _report_user_id, _restart_notice_sent
         if is_dm or getattr(message.author, "guild_permissions", None) is not None and message.author.guild_permissions.manage_messages:
             if _report_user_id != message.author.id:
                 _report_user_id = message.author.id
                 print(f"[監視レポート] 通知先を覚えた: {message.author}")
+            if not _restart_notice_sent:
+                _restart_notice_sent = True
+                try:
+                    dm = await message.author.create_dm()
+                    await dm.send(f"🕐 tempusの次の定期再起動は {_next_restart_text()} 頃だよ。その瞬間だけ数十秒〜1分くらいオフラインになるよ。")
+                except Exception as e:
+                    print(f"[再起動] 予定時刻のDM送信に失敗: {e}", flush=True)
         clean = message.content
         if bot.user:
             clean = clean.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
