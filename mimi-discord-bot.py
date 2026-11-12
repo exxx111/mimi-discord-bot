@@ -216,9 +216,123 @@ AI_SYSTEM_PROMPT = (
     "雑談は短く楽しく、説明を求められたらしっかり長めに（最大で600字くらい、必要なら箇条書きも可）答えてください。"
     "分からないことは正直に「わかんないや」と言い、推測のときは「たぶん」と断ってください。うそはつかないでください。"
     "同じ言い回しを繰り返さず、ときどき相手に質問して会話を続けてください。"
-    "明るくフレンドリーに、日本語で答えてください。"
+    "明るくフレンドリーに答えてください。あなたは日本語・英語・フィリピン語（タガログ語）・ラテン語・韓国語で話せます。"
     "サーバーの安全を見守るのが仕事で、スパムや禁止ワードを見つけてログに記録しています。"
 )
+
+# ---------- 多言語対応（英語・フィリピン語・ラテン語・韓国語を追加） ----------
+# ユーザーごとに「今どの言語で返すか」を覚える（再起動でリセットされる）。
+user_langs: dict[int, str] = {}
+_LANG_NAMES = {
+    "ja": "日本語",
+    "en": "English（英語）",
+    "fil": "Filipino（フィリピン語／タガログ語）",
+    "la": "Latin（ラテン語）",
+    "ko": "한국어（韓国語）",
+}
+_LANG_INSTRUCTIONS = {
+    "ja": "相手への返事は必ず日本語で書いてください。",
+    "en": "You must reply to this user in English only. Keep proper nouns, unit names and game codes exactly as written.",
+    "fil": "Dapat kang sumagot sa user na ito sa Filipino (Tagalog) lamang. Panatilihin ang mga pangngalang pantangi at game codes kung ano ang nakasulat.",
+    "la": "Huic utenti Latine classice responde. 文は古典ラテン語で書いてください。ただし文のあとに「（訳：…）」で短い日本語訳を必ず添えてください。固有名詞とゲームのコードは原文のままにしてください。",
+    "ko": "이 사용자에게는 반드시 한국어로만 답해 주세요. 고유명사와 게임 코드는 원문 그대로 두세요.",
+}
+_LANG_CONFIRMATIONS = {
+    "ja": "わかった！これからは日本語で話すね♪",
+    "en": "Got it! I'll speak in English from now on. Ask me anything!",
+    "fil": "Sige! Mula ngayon, sa Filipino na ako magsasalita. Magtanong ka lang ng kahit ano!",
+    "la": "Bene! Ex hoc tempore Latine loquar.（訳：わかった！これからはラテン語で話すね）",
+    "ko": "알겠어! 이제부터 한국어로 말할게. 뭐든지 물어봐!",
+}
+_FILIPINO_WORDS = {
+    "kumusta", "kamusta", "salamat", "maraming", "mahal", "kita", "ako", "ikaw", "siya",
+    "tayo", "kayo", "sila", "kami", "namin", "natin", "ang", "mga", "sa", "na", "pa",
+    "po", "opo", "hindi", "ano", "sino", "saan", "kailan", "bakit", "paano", "magkano",
+    "gusto", "ayaw", "pwede", "puwede", "talaga", "sobra", "maganda", "magandang",
+    "pogi", "pagkain", "laro", "umaga", "gabi", "hapon", "ngayon", "bukas", "kahapon",
+    "kaibigan", "pamilya", "bahay", "trabaho", "pera", "tubig", "kanin", "masarap",
+    "mabait", "masaya", "malungkot", "pagod", "gutom", "sige", "tara", "ingat",
+    "paalam", "pasensya", "sandali", "mabilis", "mabagal", "malaki", "maliit",
+}
+_LATIN_STRONG = {
+    "salve", "ave", "gratias", "latine", "vale", "quid", "amicus", "amica", "ego",
+    "sumus", "loquere", "senatus", "romae", "puella", "deus", "fortuna",
+}
+_LATIN_WORDS = _LATIN_STRONG | {
+    "et", "est", "sunt", "esse", "non", "cum", "ad", "ex", "per", "pro", "sine",
+    "meus", "tuus", "noster", "puer", "roma", "amor", "vita", "magna", "magnus",
+    "parva", "parvus", "bonus", "bona", "malus", "felix", "quod", "qui", "quae",
+    "quam", "nos", "vos", "sum", "es", "estis", "erat", "erant", "habet", "habent",
+    "dicit", "dicunt", "facit", "venit", "videt", "amat", "amant", "loquitur",
+    "bellum", "pacem", "luna", "terra", "mare", "caelum", "ignis", "aqua",
+}
+_ENGLISH_WORDS = {
+    "hello", "hi", "hey", "please", "thank", "thanks", "what", "how", "why", "when",
+    "where", "who", "is", "are", "was", "were", "the", "this", "that", "you", "your",
+    "can", "could", "would", "should", "does", "did", "good", "morning", "night",
+    "game", "update", "code", "news", "weather", "today", "tomorrow", "yesterday",
+    "friend", "love", "like", "want", "need", "tell", "show", "give", "help",
+    "play", "playing",
+}
+
+
+def _detect_lang(text: str) -> str | None:
+    """発言の言語を推定する（対応: ja / en / fil / la / ko）。分からなければ None。"""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if re.search(r"[가-힣]", t):
+        return "ko"
+    if re.search(r"[ぁ-ヿ]", t):
+        return "ja"
+    words = re.findall(r"[a-z']+", t.lower())
+    if words:
+        fil = sum(1 for w in words if w in _FILIPINO_WORDS)
+        la = sum(1 for w in words if w in _LATIN_WORDS)
+        la_strong = sum(1 for w in words if w in _LATIN_STRONG)
+        en = sum(1 for w in words if w in _ENGLISH_WORDS)
+        if fil >= 1 and fil >= en and fil >= la:
+            return "fil"
+        if la_strong >= 1 or la >= 2:
+            if la >= en:
+                return "la"
+        if en >= 1:
+            return "en"
+        if len(words) >= 4:
+            return "en"
+    if re.search(r"[一-鿿]", t):
+        return "ja"
+    return None
+
+
+def _requested_lang(text: str) -> str | None:
+    """「英語で話して」のような明示的な言語の切り替え希望があれば、その言語コードを返す。"""
+    t = (text or "").strip()
+    low = t.lower()
+    checks = [
+        ("ja", [r"(日本語|にほんご).{0,8}(話して|はなして|答えて|返事して|戻して|にして|でお願い|モード)", r"^(日本語|にほんご)(で|に)?[！!。\s]*$"]),
+        ("en", [r"(英語|えいご).{0,8}(話して|答えて|返事して|にして|でお願い|モード)", r"\b(speak|talk|reply|answer|respond)\b[^.]{0,24}\benglish\b", r"\bin english please\b", r"^english( please)?[!. ]*$"]),
+        ("fil", [r"(フィリピン語|タガログ語).{0,8}(話して|答えて|返事して|にして|でお願い|モード)", r"\b(speak|talk|reply|answer|respond)\b[^.]{0,24}\b(tagalog|filipino)\b", r"\bsa (tagalog|filipino)\b[^.]{0,16}\b(please|magsalita|sumagot)\b", r"^(tagalog|filipino)( please)?[!. ]*$"]),
+        ("la", [r"(ラテン語|らてんご).{0,8}(話して|答えて|返事して|にして|でお願い|モード)", r"\b(speak|talk|reply|answer|respond)\b[^.]{0,24}\blatin\b", r"\bin latin please\b", r"\blatine\b[^.]{0,24}\b(loquere|responde)\b", r"^latin( please)?[!. ]*$", r"^latine[!. ]*$"]),
+        ("ko", [r"(韓国語|かんこくご).{0,8}(話して|答えて|返事して|にして|でお願い|モード)", r"한국어로\s*(말해|얘기해|대답해|해줘|해주세요|해)", r"\b(speak|talk|reply|answer|respond)\b[^.]{0,24}\bkorean\b", r"\bin korean please\b", r"^korean( please)?[!. ]*$", r"^한국어로[!. ]*$"]),
+    ]
+    for code, pats in checks:
+        for pat in pats:
+            if re.search(pat, low if code != "ja" and "日本" not in pat and "韓国" not in pat and "한국" not in pat else t):
+                return code
+    return None
+
+
+def _note_user_lang(user_id: int, text: str) -> None:
+    """発言から言語を推定して、その人の返信言語として覚える。"""
+    if not user_id:
+        return
+    lang = _detect_lang(text)
+    if lang and user_langs.get(user_id) != lang:
+        user_langs[user_id] = lang
+        print(f"[言語] 返信言語を {_LANG_NAMES.get(lang, lang)} に設定 (user={user_id})", flush=True)
+
+
 def _system_prompt(user_id: int | None = None) -> str:
     """AI_SYSTEM_PROMPT に今日の日付と調べものの指示を足したもの。"""
     now = datetime.now(timezone(timedelta(hours=9)))
@@ -231,6 +345,11 @@ def _system_prompt(user_id: int | None = None) -> str:
         + "ユーザーの発言に【調べた情報】が付いていたら、その情報をもとに具体的に答えてください（数字や固有名詞は情報のものをそのまま使う）。観測データ（サーバーの会話ログの集計）が付いていたら、第三者目線で客観的に、数字をもとに分析して答えてください。"
         + "ゲームのアップデート情報のときは、最初に「アップデート名（日付）」、次にコードがあれば「コード名：報酬」を箇条書き、新ユニット、新要素の順で、短い箇条書き中心にまとめてください。情報に無いコードやユニット名は絶対に作らないでください。"
         + "調べた情報が付いていない最新ニュースや天気は、知らないと正直に言ってください。"
+        + (
+            _LANG_INSTRUCTIONS[user_langs[user_id]]
+            if user_id and user_langs.get(user_id) in _LANG_INSTRUCTIONS
+            else "相手が話しかけた言語（日本語・英語・フィリピン語・韓国語・ラテン語のいずれか）に合わせて、必ず同じ言語で返事をしてください。判定できないときは日本語で返事をしてください。ラテン語のときは古典ラテン語で返し、あとに短い日本語訳を添えてください。"
+        )
         + (f"今話している相手の名前は「{user_names[user_id]}」です。たまに名前で呼んであげてください。" if user_id and user_names.get(user_id) else "")
     )
 
@@ -596,6 +715,17 @@ async def _vision_reply(user_id: int, text: str, image: tuple[bytes, str]) -> st
 
 async def smart_reply(user_id: int, text: str, image: tuple[bytes, str] | None = None) -> str:
     """名前を覚える処理はルールで、会話はAI（あれば）→ダメならルール返信。"""
+    # 言語の明示的な切り替え（「英語で話して」「한국어로 말해줘」など）はAIに任せず即答する
+    req_lang = _requested_lang(text)
+    if req_lang and image is None:
+        user_langs[user_id] = req_lang
+        print(f"[言語] 切り替え希望で {_LANG_NAMES.get(req_lang, req_lang)} に設定 (user={user_id})", flush=True)
+        history = _ai_history[user_id]
+        history.append(("user", text))
+        history.append(("ai", _LANG_CONFIRMATIONS[req_lang]))
+        del history[:-24]
+        return _LANG_CONFIRMATIONS[req_lang]
+    _note_user_lang(user_id, text)
     m = re.search(r"名前は\s*(.+)", text.strip())
     if m:
         name = m.group(1).strip(" 　です。、")[:20]
@@ -1097,7 +1227,7 @@ def _lookup_context(text: str) -> tuple[str, str]:
 
 
 # ---------- 会話の観測・分析（第三者目線・客観） ----------
-_ANALYSIS_WORDS = ("分析", "グラフ", "統計", "観測")
+_ANALYSIS_WORDS = ("分析", "グラフ", "統計", "観測", "analyze", "analysis", "graph", "statistics", "분석", "그래프", "통계", "pagsusuri")
 
 
 def _conversation_stats(guild_name: str = "") -> dict:
@@ -2051,7 +2181,7 @@ async def on_message(message: discord.Message):
             _schedule_reminder(message, seconds, note)
             await send_thoughtful_reply(message, f"おけ！{label}に知らせるね。", clean)
             return
-        if any(w in clean for w in _ANALYSIS_WORDS):
+        if any(w in clean.lower() for w in _ANALYSIS_WORDS):
             gname = message.guild.name if message.guild else ""
             summary, png = await asyncio.to_thread(_analysis_reply, gname)
             print(f"[分析] 会話分析を返信（{gname or 'DM'}）", flush=True)
