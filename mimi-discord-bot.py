@@ -28,6 +28,7 @@ Render等のWebサービスで動かす場合:
 """
 
 import base64
+import io
 import json
 import os
 import re
@@ -37,7 +38,7 @@ import asyncio
 import threading
 import urllib.error
 import urllib.request
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -227,7 +228,7 @@ def _system_prompt(user_id: int | None = None) -> str:
         AI_SYSTEM_PROMPT
         + f"今は{today}（日本時間）です。"
         + "あなたは天気予報・ニュース・Web検索で調べものができて、ゲームのアップデート情報も調べられます。頼まれればリマインダー（○分後に知らせる）もできます。"
-        + "ユーザーの発言に【調べた情報】が付いていたら、その情報をもとに具体的に答えてください（数字や固有名詞は情報のものをそのまま使う）。"
+        + "ユーザーの発言に【調べた情報】が付いていたら、その情報をもとに具体的に答えてください（数字や固有名詞は情報のものをそのまま使う）。観測データ（サーバーの会話ログの集計）が付いていたら、第三者目線で客観的に、数字をもとに分析して答えてください。"
         + "ゲームのアップデート情報のときは、最初に「アップデート名（日付）」、次にコードがあれば「コード名：報酬」を箇条書き、新ユニット、新要素の順で、短い箇条書き中心にまとめてください。情報に無いコードやユニット名は絶対に作らないでください。"
         + "調べた情報が付いていない最新ニュースや天気は、知らないと正直に言ってください。"
         + (f"今話している相手の名前は「{user_names[user_id]}」です。たまに名前で呼んであげてください。" if user_id and user_names.get(user_id) else "")
@@ -1080,6 +1081,9 @@ def _lookup_context(text: str) -> tuple[str, str]:
     if "ニュース" in text:
         print("[調べもの] ニュース")
         return "ニュース", _news_lookup()
+    if any(w in text for w in ("サーバーの様子", "みんなの様子", "会話の様子", "サーバーの状況", "最近のサーバー")):
+        print("[調べもの] 観測データ")
+        return "観測", _analysis_summary()
     if any(w in text for w in ("調べて", "検索して", "検索", "探して", "ググって")):
         query = text
         for w in ("調べて", "検索して", "検索", "探して", "ググって", "教えて", "知りたい", "について", "って何", "とは"):
@@ -1090,6 +1094,78 @@ def _lookup_context(text: str) -> tuple[str, str]:
             parts = [x for x in (_web_search(query), _wiki_lookup(query)) if x]
             return "検索", "\n".join(parts)
     return "", ""
+
+
+# ---------- 会話の観測・分析（第三者目線・客観） ----------
+_ANALYSIS_WORDS = ("分析", "グラフ", "統計", "観測")
+
+
+def _conversation_stats(guild_name: str = "") -> dict:
+    """記録済みログから会話の統計を作る（指定があればそのサーバー分だけ）。"""
+    entries = [e for e in log_entries if not guild_name or e.get("guild") == guild_name]
+    users = Counter(e.get("user", "?") for e in entries)
+    channels = Counter(e.get("channel", "?") for e in entries)
+    flagged = [e for e in entries if e.get("flagged")]
+    reasons = Counter()
+    for e in flagged:
+        reasons[(e.get("reason") or "検知").split("（")[0]] += 1
+    hours = Counter(e["time"].hour for e in entries if e.get("time"))
+    return {"total": len(entries), "users": users, "channels": channels,
+            "flagged": flagged, "reasons": reasons, "hours": hours}
+
+
+def _analysis_summary(guild_name: str = "") -> str:
+    """観測データの要約（第三者目線・客観的に、数字で示す）。"""
+    st = _conversation_stats(guild_name)
+    if st["total"] == 0:
+        return "観測データがまだないよ。サーバーで会話が進むと、ここに記録がたまっていくよ。"
+    lines = [f"📊 会話の観測レポート（記録{st['total']}件・第三者目線）"]
+    top = st["users"].most_common(5)
+    lines.append("発言数トップ: " + "、".join(f"{u} {c}件" for u, c in top))
+    if st["channels"]:
+        ch, cc = st["channels"].most_common(1)[0]
+        lines.append(f"一番活発なチャンネル: #{ch}（{cc}件）")
+    if st["hours"]:
+        h, hc = st["hours"].most_common(1)[0]
+        lines.append(f"一番活発な時間帯: {h}時台（{hc}件）")
+    if st["flagged"]:
+        lines.append(f"検知（スパム・暴言など）: {len(st['flagged'])}件")
+        for r, c in st["reasons"].most_common(3):
+            lines.append(f"・{r}: {c}件")
+    else:
+        lines.append("検知（スパム・暴言など）: 0件")
+    return "\n".join(lines)
+
+
+def _chart_png(labels: list[str], values: list[int], title: str) -> bytes | None:
+    """棒グラフのPNGを作る（QuickChart）。失敗したら None。"""
+    colors = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1"]
+    cfg = {"type": "bar",
+           "data": {"labels": labels,
+                    "datasets": [{"label": "件数", "data": values,
+                                  "backgroundColor": [colors[i % len(colors)] for i in range(len(values))]}]},
+           "options": {"title": {"display": True, "text": title}, "legend": {"display": False},
+                       "scales": {"yAxes": [{"ticks": {"beginAtZero": True}}]}}}
+    url = "https://quickchart.io/chart?w=800&h=450&bkg=white&c=" + _urlparse.quote(json.dumps(cfg, ensure_ascii=False))
+    try:
+        req = urllib.request.Request(url, headers=_UA)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read()
+        return data if data[:4] == b"\x89PNG" else None
+    except Exception as e:
+        print(f"[分析] グラフ作成に失敗: {e}")
+        return None
+
+
+def _analysis_reply(guild_name: str) -> tuple[str, bytes | None]:
+    """分析レポート本文と、発言数トップ5のグラフPNGを返す。"""
+    st = _conversation_stats(guild_name)
+    summary = _analysis_summary(guild_name)
+    png = None
+    if st["total"] > 0 and st["users"]:
+        top = st["users"].most_common(5)
+        png = _chart_png([u.split("#")[0] for u, _ in top], [c for _, c in top], "発言数トップ5")
+    return summary, png
 
 
 # ---------- リマインダー ----------
@@ -1974,6 +2050,17 @@ async def on_message(message: discord.Message):
             seconds, label, note = rem
             _schedule_reminder(message, seconds, note)
             await send_thoughtful_reply(message, f"おけ！{label}に知らせるね。", clean)
+            return
+        if any(w in clean for w in _ANALYSIS_WORDS):
+            gname = message.guild.name if message.guild else ""
+            summary, png = await asyncio.to_thread(_analysis_reply, gname)
+            print(f"[分析] 会話分析を返信（{gname or 'DM'}）", flush=True)
+            await send_thoughtful_reply(message, summary, clean)
+            if png:
+                try:
+                    await message.channel.send(file=discord.File(io.BytesIO(png), filename="analysis.png"))
+                except Exception as e:
+                    print(f"[分析] グラフ送信に失敗: {e}", flush=True)
             return
         image = None
         for att in message.attachments:
