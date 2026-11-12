@@ -344,6 +344,7 @@ def _system_prompt(user_id: int | None = None) -> str:
         + "あなたは天気予報・ニュース・Web検索で調べものができて、ゲームのアップデート情報も調べられます。頼まれればリマインダー（○分後に知らせる）もできます。"
         + "ユーザーの発言に【調べた情報】が付いていたら、その情報をもとに具体的に答えてください（数字や固有名詞は情報のものをそのまま使う）。観測データ（サーバーの会話ログの集計）が付いていたら、第三者目線で客観的に、数字をもとに分析して答えてください。"
         + "ゲームのアップデート情報のときは、最初に「アップデート名（日付）」、次にコードがあれば「コード名：報酬」を箇条書き、新ユニット、新要素の順で、短い箇条書き中心にまとめてください。情報に無いコードやユニット名は絶対に作らないでください。"
+        + "フォートナイトの情報が付いていたら、最初に現在のバージョンと最新ニュース、次に次のアプデ予定、次におすすめの降り場（地名リストの中から、激戦区と安定降りを理由つきで1つずつ）、強い武器（武器プールの中からだけ選ぶ）、有利な立ち回り（序盤・中盤・終盤）の順で答えてください。情報に無いバージョン・日付・武器名・地名は作らないでください。予定やリークの話は、公式確定ではないと分かるように書いてください。"
         + "調べた情報が付いていない最新ニュースや天気は、知らないと正直に言ってください。"
         + (
             _LANG_INSTRUCTIONS[user_langs[user_id]]
@@ -488,6 +489,14 @@ async def ai_reply(user_id: int, text: str) -> str | None:
     history = _ai_history[user_id]
     reply: str | None = None
     ai_text = text
+    if _is_fortnite_question(text) and not _fortnite_has_strategy(text):
+        fixed_fn = await asyncio.to_thread(_fortnite_fixed_reply, text)
+        if fixed_fn:
+            print("[調べもの] Fortniteアプデ情報（固定形式で回答）", flush=True)
+            history.append(("user", text))
+            history.append(("ai", fixed_fn))
+            del history[:-24]
+            return fixed_fn
     if _is_update_question(text):
         fixed = await asyncio.to_thread(_fixed_update_reply, text)
         if fixed:
@@ -1044,6 +1053,181 @@ def _game_guide_lookup(eng: str) -> list[str]:
     return parts
 
 
+# ---------- Fortnite（フォートナイト）専用の情報取得 ----------
+# Epic公式系API（fortnite-api.com）＋日本語ニュース（FNJPNews、Xの公式発表・リークをまとめている）
+# ＋武器プール（fortnite.gg）＋次回アプデ予定（ロードマップまとめ）から集める。
+_FORTNITE_ALIASES = ("フォートナイト", "フォトナ", "Fortnite", "fortnite", "FORTNITE")
+_FORTNITE_STRATEGY_WORDS = ("降り", "着地", "武器", "立ち回り", "マップ", "おすすめ", "強い", "ティア", "有利", "勝ち方", "ビクロイ", "landing", "weapon", "rotation", "drop")
+_FORTNITE_ITEM_WORDS = ("Potion", "Meat", "Med Kit", "Tangerine", "Bandage", "Slurp", "Chug", "Apple", "Fishing Rod", "Flopper", "Jellyfish", "Pepper", "Fish", "Fry", "Extractor", "Deployer", "Vault Key", "Grenade")
+
+
+def _is_fortnite_question(text: str) -> bool:
+    """フォートナイトのアプデ・攻略を聞いている発言かどうか。"""
+    if not any(a in text for a in _FORTNITE_ALIASES):
+        return False
+    low = text.lower()
+    return ("アプデ" in text or "アップデート" in text or "次" in text
+            or any(w in text for w in ("最新", "情報", "シーズン"))
+            or any(w in text for w in _FORTNITE_STRATEGY_WORDS)
+            or any(w in low for w in ("update", "next", "best")))
+
+
+def _fortnite_has_strategy(text: str) -> bool:
+    return any(w in text or w in text.lower() for w in _FORTNITE_STRATEGY_WORDS)
+
+
+def _fortnite_data() -> dict:
+    """Fortniteの現在データ（バージョン・ニュース・新アイテム・マップ・武器）を公式系API等から集める。"""
+    d: dict = {"version": "", "date": "", "news": [], "news_body": "", "items": [], "pois": [], "weapons": []}
+    try:
+        cos = _http_get_json("https://fortnite-api.com/v2/cosmetics/new?language=ja", timeout=12)
+        dd = cos.get("data") or {}
+        bm = re.search(r"Release-(\d+)\.(\d+)", dd.get("build", ""))
+        if bm:
+            d["version"] = f"{bm.group(1)}.{bm.group(2)}"
+        raw_date = str(dd.get("date", ""))[:10]
+        if re.match(r"\d{4}-\d{2}-\d{2}", raw_date):
+            _y, mo, da = raw_date.split("-")
+            d["date"] = f"{int(mo)}月{int(da)}日"
+        items = ((dd.get("items") or {}).get("br")) or []
+        for it in items[:30]:
+            nm = it.get("name", "")
+            tp = (it.get("type") or {}).get("displayValue", "")
+            if nm:
+                d["items"].append(f"{nm}（{tp}）" if tp else nm)
+    except Exception as e:
+        print(f"[調べもの] Fortnite新アイテム取得に失敗: {e}", flush=True)
+    try:
+        news = _http_get_json("https://fortnite-api.com/v2/news/br?language=ja", timeout=12)
+        motds = ((news.get("data") or {}).get("motds")) or []
+        for m in motds[:5]:
+            if m.get("title"):
+                d["news"].append(m["title"])
+        if motds and motds[0].get("body"):
+            d["news_body"] = motds[0]["body"][:400]
+    except Exception as e:
+        print(f"[調べもの] Fortniteニュース取得に失敗: {e}", flush=True)
+    try:
+        mp = _http_get_json("https://fortnite-api.com/v1/map?language=ja", timeout=12)
+        for p in ((mp.get("data") or {}).get("pois")) or []:
+            nm = p.get("name", "")
+            if nm and "UnNamed" not in p.get("id", "") and nm != "宝箱" and nm not in d["pois"]:
+                d["pois"].append(nm)
+    except Exception as e:
+        print(f"[調べもの] Fortniteマップ取得に失敗: {e}", flush=True)
+    try:
+        page = _http_get_text("https://fortnite.gg/weapons", timeout=12)
+        names: list[str] = []
+        for raw in re.findall(r"<h3[^>]*>([^<]+)</h3>", page):
+            nm = _html.unescape(raw).strip()
+            if nm and nm not in names and not any(w in nm for w in _FORTNITE_ITEM_WORDS):
+                names.append(nm)
+        d["weapons"] = names[:20]
+    except Exception as e:
+        print(f"[調べもの] Fortnite武器一覧の取得に失敗: {e}", flush=True)
+    return d
+
+
+def _fortnite_next_update() -> str:
+    """次回アプデの予定（ロードマップまとめサイトから日付を抽出）。無ければ ""。"""
+    try:
+        page = _http_get_text("https://www.esports.net/wiki/guides/fortnite-chapter-8/", timeout=12)
+        plain = re.sub(r"\s+", " ", _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S)))
+        m = re.search(r"Chapter 8 \(v(\d+\.\d+)\) is set to launch on ([A-Z][a-z]+) (\d+), (\d+)", plain)
+        if m and m.group(2) in _MONTHS:
+            return f"次の大きなアプデはチャプター8（v{m.group(1)}）で、{_MONTHS[m.group(2)]}月{m.group(3)}日開始予定（ロードマップ／リークまとめ情報で、公式確定ではない）"
+    except Exception as e:
+        print(f"[調べもの] Fortnite次回アプデ取得に失敗: {e}", flush=True)
+    return ""
+
+
+def _fortnite_jp_news() -> list[str]:
+    """日本語のFortniteニュースサイト（Xの公式発表・リークをまとめている）の見出しを拾う。"""
+    try:
+        page = _http_get_text("https://fnjpnews.com/", timeout=12)
+        plain = re.sub(r"\s+", " ", _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S)))
+        heads: list[str] = []
+        for m in re.finditer(r"【フォートナイト】([^【】]{8,60}?)(?=Fortnite|【|$)", plain):
+            raw_h = m.group(1)
+            # 古い記事や無関係な人気記事（旧バージョン・デバイス紹介など）は除外する
+            if any(x in raw_h for x in ("2022年", "2025年", "デバイス", "感度", "エラーが頻発", "年齢制限")):
+                continue
+            if re.search(r"v4[0-2]\.", raw_h):
+                continue
+            h = raw_h.strip(" 　|｜")
+            h = re.sub(r"(\d{4}年\d{1,2}月\d{1,2}日|新着記事).*$", "", h).strip(" 　|｜")
+            if not h or h in heads:
+                continue
+            heads.append(h)
+        # 今のバージョン（v43系）やチャプターの話題を先に並べる
+        heads.sort(key=lambda h: 0 if ("v43" in h or "43.10" in h or "チャプター" in h) else 1)
+        return heads[:5]
+    except Exception as e:
+        print(f"[調べもの] Fortnite日本語ニュース取得に失敗: {e}", flush=True)
+        return []
+
+
+def _fortnite_context(text: str) -> str:
+    """AIに渡すFortnite情報（公式系API＋日本語ニュース＋武器＋マップ＋次回予定）。"""
+    d = _fortnite_data()
+    parts = []
+    if d["version"]:
+        parts.append(f"現在のバージョン: v{d['version']}（{d['date']}更新）")
+    if d["news"]:
+        parts.append("ゲーム内ニュース（公式）: " + " / ".join(d["news"]))
+    if d["news_body"]:
+        parts.append("注目ニュースの内容: " + d["news_body"])
+    jp = _fortnite_jp_news()
+    if jp:
+        parts.append("日本語ニュース見出し（Xの公式発表・リークまとめサイトより）: " + " / ".join(jp))
+    if d["items"]:
+        parts.append("最近追加されたアイテム: " + "、".join(d["items"][:15]))
+    nxt = _fortnite_next_update()
+    if nxt:
+        parts.append("次回アプデ予定: " + nxt)
+    if d["pois"]:
+        parts.append("今のマップの地名（POI）: " + "、".join(d["pois"]))
+    if d["weapons"]:
+        parts.append("現在の武器プール（英語名）: " + ", ".join(d["weapons"]))
+    print("[調べもの] Fortnite情報を収集", flush=True)
+    return "\n".join(parts)
+
+
+def _fortnite_fixed_reply(text: str) -> str | None:
+    """Fortniteのアプデ質問には、公式系APIの情報から決まった形式で直接答える。"""
+    d = _fortnite_data()
+    if not d["version"] and not d["news"]:
+        return None
+    lines = [f"**フォートナイト v{d['version']} アプデ情報**" + (f"（{d['date']}）" if d["date"] else ""), ""]
+    if d["news"]:
+        lines.append("🆕 ゲーム内ニュース（公式）")
+        for t in d["news"]:
+            lines.append(f"・{t}")
+        lines.append("")
+    jp = _fortnite_jp_news()
+    if jp:
+        lines.append("📰 最新ニュース・リーク（日本語まとめ）")
+        for h in jp[:3]:
+            lines.append(f"・{h}")
+        lines.append("")
+    if d["items"]:
+        lines.append("🎁 最近の新アイテム例")
+        lines.append("、".join(d["items"][:10]))
+        lines.append("")
+    nxt = _fortnite_next_update()
+    if nxt:
+        lines.append("🔜 次のアプデ")
+        lines.append(nxt)
+        lines.append("")
+    if d["pois"]:
+        lines.append("📍 今のマップの地名")
+        lines.append("、".join(d["pois"]))
+        lines.append("")
+    lines.append("情報元：Epic公式系API・日本語ニュース（Xの公式発表まとめ）")
+    lines.append("降り場・武器・立ち回りのおすすめは「フォートナイト 降りる場所 おすすめ」みたいに聞いてね")
+    return "\n".join(lines)[:980]
+
+
 def _game_update_lookup(text: str) -> str:
     """ゲームの最新アップデート情報を、Roblox公式情報＋Web検索で集める。"""
     title = text
@@ -1200,6 +1384,8 @@ def _fixed_update_reply(text: str) -> str | None:
 
 def _lookup_context(text: str) -> tuple[str, str]:
     """発言内容を見て、必要な調べものを実行し (種類, 結果テキスト) を返す。"""
+    if _is_fortnite_question(text):
+        return "Fortnite", _fortnite_context(text)
     if _is_update_question(text):
         return "アプデ情報", _game_update_lookup(text)
     if "天気" in text:
