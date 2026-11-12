@@ -368,6 +368,14 @@ async def ai_reply(user_id: int, text: str) -> str | None:
     history = _ai_history[user_id]
     reply: str | None = None
     ai_text = text
+    if _is_update_question(text):
+        fixed = await asyncio.to_thread(_fixed_update_reply, text)
+        if fixed:
+            print("[調べもの] アプデ情報（固定形式で回答）", flush=True)
+            history.append(("user", text))
+            history.append(("ai", fixed))
+            del history[:-24]
+            return fixed
     kind, ctx = await asyncio.to_thread(_lookup_context, text)
     if ctx:
         ai_text = f"【調べた情報】\n{ctx}\n\n【ユーザーの発言】\n{text}"
@@ -800,6 +808,8 @@ def _news_lookup() -> str:
 # ゲーム名の別名→英語名（検索用）と、更新ログWiki
 _GAME_ALIASES = {
     "アニメヴァンガード": "Anime Vanguards",
+    "アニメヴェンカード": "Anime Vanguards",
+    "アニメバンガード": "Anime Vanguards",
     "ヴァンガード": "Anime Vanguards",
     "バンガード": "Anime Vanguards",
     "ヴェンカード": "Anime Vanguards",
@@ -949,11 +959,110 @@ def _game_update_lookup(text: str) -> str:
     return "\n".join(parts)
 
 
+def _is_update_question(text: str) -> bool:
+    """ゲームのアプデ情報を聞いている発言かどうか。"""
+    if "アプデ" in text or "アップデート" in text:
+        return True
+    return any(k in text for k in _GAME_ALIASES) and any(w in text for w in ("最新", "情報", "コード"))
+
+
+_MONTHS = {"January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
+           "July": 7, "August": 8, "September": 9, "October": 10, "November": 11, "December": 12}
+
+
+def _fixed_update_reply(text: str) -> str | None:
+    """アプデ質問には、取得した情報から決まった形式で直接答える（AI任せにしない）。
+    対応できないゲーム・取得失敗のときは None（通常のAI回答に任せる）。"""
+    title = text
+    for w in ("アップデート", "アプデ", "最新", "情報", "教えて", "知りたい", "の", "は", "を", "に", "？", "?", "！", "!", "。", "、", "・"):
+        title = title.replace(w, "")
+    title = title.strip()
+    eng = _GAME_ALIASES.get(title, "")
+    if not eng:
+        for k, v in _GAME_ALIASES.items():
+            if k in text:
+                eng = v
+                title = k
+                break
+    if not eng or eng not in _GAME_GUIDES:
+        return None
+    subtitle = ""
+    uid = _GAME_UNIVERSES.get(eng)
+    if uid:
+        try:
+            data = _http_get_json(f"https://games.roblox.com/v1/games?universeIds={uid}", timeout=10)
+            if data.get("data"):
+                gname = data["data"][0].get("name", "")
+                subtitle = gname.split(": ", 1)[1] if ": " in gname else gname
+        except Exception:
+            pass
+    try:
+        page = _http_get_text(_GAME_GUIDES[eng], timeout=12)
+    except Exception as e:
+        print(f"[調べもの] ガイドサイトの取得に失敗: {e}")
+        return None
+    plain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S))
+    plain = re.sub(r"\s+", " ", plain)
+    codes = []
+    for name, reward, lv in re.findall(r"([A-Za-z][A-Za-z0-9]{2,30})Copy(.{2,80}?)\(Level (\d+)\)", plain)[:5]:
+        if "Added" in name:
+            name = name.split("Added")[-1]
+        codes.append((name, reward.strip(), lv))
+    version = ""
+    release = ""
+    units: list[str] = []
+    m = re.search(r'href="(/blog/[^"]*update[^"]*)"', page)
+    if m:
+        vm = re.search(r"update-(\d+)-(\d+)", m.group(1))
+        if vm:
+            version = f"{vm.group(1)}.{vm.group(2)}"
+        try:
+            art = _http_get_text("https://bloxguidesgg.com" + m.group(1), timeout=12)
+            aplain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", art, flags=re.S))
+            aplain = re.sub(r"\s+", " ", aplain)
+            rm = re.search(r"went live on ([A-Z][a-z]+) (\d+)", aplain)
+            if rm and rm.group(1) in _MONTHS:
+                release = f"{_MONTHS[rm.group(1)]}月{rm.group(2)}日"
+            occ = [mm.start() for mm in re.finditer(r"Every new unit", aplain)]
+            if occ:
+                j = occ[1] if len(occ) >= 2 else occ[0]
+                seg = aplain[j:j + 1500]
+                for ch in re.split(r"(?:Mythic|Secret|Vanguard|Exclusive|Legendary)", seg)[:-1]:
+                    mm = re.search(r"((?:[A-Z][A-Za-z.]+)(?: [A-Z][A-Za-z.]+){0,3}(?: \([A-Za-z0-9 ]+\))?)$", ch.strip())
+                    if mm and mm.group(1) not in units:
+                        units.append(mm.group(1))
+        except Exception as e:
+            print(f"[調べもの] アプデ記事の取得に失敗: {e}")
+    if not codes and not units:
+        return None
+    head = f"**{title} {version}" if version else f"**{title} 最新アプデ"
+    if subtitle:
+        head += f"「{subtitle}」"
+    head += "**"
+    if release:
+        head += f"（{release}〜）"
+    lines = [head, ""]
+    if codes:
+        same_lv = len({lv for _, _, lv in codes}) == 1
+        if same_lv:
+            lines.append(f"🎁 新コード{len(codes)}つ（全部レベル{codes[0][2]}〜、早めに使って）")
+        else:
+            lines.append(f"🎁 新コード{len(codes)}つ（早めに使って）")
+        for name, reward, lv in codes:
+            lvtxt = "" if same_lv else f"（レベル{lv}〜）"
+            lines.append(f"・{name}：{reward}{lvtxt}")
+        lines.append("")
+    if units:
+        lines.append("🆕 新ユニット")
+        lines.append("、".join(units[:10]))
+        lines.append("")
+    lines.append("情報元：Roblox公式・英語ガイドサイト")
+    return "\n".join(lines)[:980]
+
+
 def _lookup_context(text: str) -> tuple[str, str]:
     """発言内容を見て、必要な調べものを実行し (種類, 結果テキスト) を返す。"""
-    if "アプデ" in text or "アップデート" in text:
-        return "アプデ情報", _game_update_lookup(text)
-    if any(k in text for k in _GAME_ALIASES) and any(w in text for w in ("最新", "情報", "コード")):
+    if _is_update_question(text):
         return "アプデ情報", _game_update_lookup(text)
     if "天気" in text:
         place = re.sub(r"(天気|予報|調べて|教えて|知りたい|今日|明日|明後日|現在|今|の|は|って|どう|かな|を|に|！|!|？|\?|。|、|\s)", "", text)
