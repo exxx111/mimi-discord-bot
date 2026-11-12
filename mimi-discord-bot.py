@@ -24,7 +24,7 @@ Render等のWebサービスで動かす場合:
 指定した監視ワード）は🚨検知つきで記録するよ（消したりBANはしないよ）。
 ログは「mimi-log」「みみログ」「spam-log」「警告botログ」「tempusログ」という名前のチャンネルがあればそこにも流すよ。
 🚨検知したログはクラウド（Firestore）にも保存するので、再起動しても消えないよ（起動時に復元して /log や21時のレポートで見返せる）。
-画像つきで話しかけられたら、Geminiで画像を見て答えるよ（Geminiが混んでいると見れないこともある）。
+画像つきで話しかけられたら、OpenRouter（無料の画像AI）→Geminiの順に画像を見て答えるよ（どちらも混んでいると見れないこともある）。
 """
 
 import base64
@@ -161,6 +161,7 @@ async def send_thoughtful_reply(message: discord.Message, reply: str, source_tex
 # ダメなら GEMINI_API_KEY の Gemini、それも無ければルール返信に切り替える。
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 # Groqで使いたいモデルの優先順（実際はAPIの一覧と照合して使えるものだけ使う）
 GROQ_PREFERRED = [
     "llama-3.3-70b-versatile",
@@ -385,6 +386,113 @@ async def ai_reply(user_id: int, text: str) -> str | None:
     return reply[:1000]
 
 
+_openrouter_vision_cache: list[str] | None = None
+
+
+def _openrouter_vision_models() -> list[str]:
+    """OpenRouterで使える「無料＆画像が見れる」モデルを一覧から選び、優先順に並べる。"""
+    global _openrouter_vision_cache
+    if _openrouter_vision_cache:
+        return _openrouter_vision_cache
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        free_vision: list[str] = []
+        for item in data.get("data", []):
+            pricing = item.get("pricing") or {}
+            modality = (item.get("architecture") or {}).get("modality", "")
+            if str(pricing.get("prompt", "")) == "0" and str(pricing.get("completion", "")) == "0" and "image" in modality:
+                free_vision.append(item.get("id", ""))
+        free_vision = [m for m in free_vision if m]
+
+        def rank(m: str) -> int:
+            low = m.lower()
+            if "qwen" in low and ("vl" in low or "vision" in low):
+                return 0
+            if "gemini" in low:
+                return 1
+            if "vision" in low or "-vl" in low:
+                return 2
+            return 3
+
+        free_vision.sort(key=rank)
+        if free_vision:
+            _openrouter_vision_cache = free_vision
+            print(f"[AI] OpenRouterで使える無料の画像モデル: {', '.join(free_vision[:4])}", flush=True)
+            return free_vision
+        print("[AI] OpenRouterに無料の画像モデルが見つかりませんでした", flush=True)
+    except Exception as e:
+        print(f"[AI] OpenRouterのモデル一覧の取得に失敗: {e}", flush=True)
+    return []
+
+
+def _openrouter_vision_call(model: str, prompt: str, mime: str, b64: str, timeout: float = 30, user_id: int | None = None) -> str:
+    """OpenRouterに画像を見せて答えてもらう（1回分）。"""
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _system_prompt(user_id)},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                ],
+            },
+        ],
+        "max_tokens": 1600,
+        "temperature": 0.8,
+    }
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)",
+            "HTTP-Referer": "https://mimi-discord-bot-6ol5.onrender.com",
+            "X-Title": "tempus-discord-bot",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.load(resp)
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    content = choices[0].get("message", {}).get("content", "")
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _openrouter_vision_generate(prompt: str, mime: str, data: bytes, user_id: int | None = None) -> str:
+    """OpenRouterの無料画像モデルを順に試す（最大約60秒）。全部ダメなら例外。"""
+    b64 = base64.b64encode(data).decode("ascii")
+    models = _openrouter_vision_models()
+    if not models:
+        raise RuntimeError("no free vision models on OpenRouter")
+    deadline = time.monotonic() + 60
+    last_err: Exception | None = None
+    for model in models[:4]:
+        if time.monotonic() > deadline:
+            break
+        try:
+            text = _openrouter_vision_call(model, prompt, mime, b64, timeout=30, user_id=user_id)
+            if text:
+                print(f"[AI] 使用モデル: OpenRouter {model}（画像）", flush=True)
+                return text
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (401, 403):
+                raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+    raise RuntimeError(f"OpenRouter vision failed: {last_err}")
+
+
 def _gemini_vision_call(model: str, prompt: str, mime: str, b64: str, timeout: float = 20, user_id: int | None = None) -> str:
     """Geminiに画像を見せて答えてもらう（1回分）。"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -437,14 +545,20 @@ def _gemini_vision_generate(prompt: str, mime: str, data: bytes, user_id: int | 
 
 
 async def _vision_reply(user_id: int, text: str, image: tuple[bytes, str]) -> str | None:
-    """画像を見て答える。失敗したら None。"""
+    """画像を見て答える。OpenRouter（無料）→Geminiの順に試し、失敗したら None。"""
     data, mime = image
     prompt = text.strip() or "この画像に何が写っているか教えて"
-    try:
-        reply = await asyncio.to_thread(_gemini_vision_generate, prompt, mime, data, user_id)
-    except Exception as e:
-        print(f"[AI] 画像の呼び出しに失敗: {e}", flush=True)
-        return None
+    reply = None
+    if OPENROUTER_API_KEY:
+        try:
+            reply = await asyncio.to_thread(_openrouter_vision_generate, prompt, mime, data, user_id)
+        except Exception as e:
+            print(f"[AI] 画像の呼び出しに失敗（OpenRouter）: {e}", flush=True)
+    if not reply and GEMINI_API_KEY:
+        try:
+            reply = await asyncio.to_thread(_gemini_vision_generate, prompt, mime, data, user_id)
+        except Exception as e:
+            print(f"[AI] 画像の呼び出しに失敗（Gemini）: {e}", flush=True)
     if not reply:
         return None
     history = _ai_history[user_id]
@@ -464,11 +578,11 @@ async def smart_reply(user_id: int, text: str, image: tuple[bytes, str] | None =
             _save_name_bg(user_id, name)
             return f"{name}って言うんだね！覚えたよ♪ よろしく、{name}！"
     if image is not None:
-        if GEMINI_API_KEY:
+        if OPENROUTER_API_KEY or GEMINI_API_KEY:
             reply = await _vision_reply(user_id, text, image)
             if reply:
                 return reply
-            return "画像を見ようとしたんだけど、今は画像を見るAI（Gemini）が混んでて見れなかった…また後で試してみて！"
+            return "画像を見ようとしたんだけど、今は画像を見るAIが混んでて見れなかった…また後で試してみて！"
         return "ごめん、今は画像を見る準備ができてないや…"
     if GROQ_API_KEY or GEMINI_API_KEY:
         reply = await ai_reply(user_id, text)
