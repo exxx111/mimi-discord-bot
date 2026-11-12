@@ -570,6 +570,14 @@ async def ai_reply(user_id: int, text: str) -> str | None:
             history.append(("ai", fixed_aa))
             del history[:-24]
             return fixed_aa
+        if any(w in text for w in ("アプデ", "アップデート", "最新", "コード", "新ユニット", "次回", "次の")):
+            fixed_upd = await asyncio.to_thread(_aa_update_reply)
+            if fixed_upd:
+                print("[調べもの] アニメアドベンチャー（アプデ固定形式で回答）", flush=True)
+                history.append(("user", text))
+                history.append(("ai", fixed_upd))
+                del history[:-24]
+                return fixed_upd
     if _is_fortnite_question(text) and not _fortnite_has_strategy(text) and user_langs.get(user_id) in (None, "ja"):
         fixed_fn = await asyncio.to_thread(_fortnite_fixed_reply, text)
         if fixed_fn:
@@ -1582,7 +1590,7 @@ def _aa_unit_reply(text: str) -> str | None:
     return out
 
 
-def _aa_new_units() -> str:
+def _aa_new_units(seg_len: int = 1500) -> str:
     """英語ティアリストサイトの「New UPD ○ units」欄から新ユニット情報を取る。"""
     try:
         page = _http_get_text("https://tierlistanimeadventures.com/units/", timeout=12)
@@ -1594,7 +1602,7 @@ def _aa_new_units() -> str:
     m = re.search(r"New UPD [0-9.]+ units", plain)
     if not m:
         return ""
-    return plain[m.start():m.start() + 1500]
+    return plain[m.start():m.start() + seg_len]
 
 
 def _aa_codes_crosscheck(wiki_codes_text: str) -> str:
@@ -1649,6 +1657,101 @@ def _aa_event_info() -> str:
     if i < 0:
         return ""
     return "夏イベント情報（英語サイト）:\n" + plain[i:i + 1000]
+
+
+def _aa_update_reply() -> str | None:
+    """アプデ質問への固定形式の回答を、取得データから直接組み立てる（AI任せにしない）。"""
+    seg = _aa_new_units(2800)
+    cards: list[tuple[str, str, str]] = []
+    if seg:
+        for tier, name, role in re.findall(r"\b([SAB]) ((?:[A-Z][A-Za-z]+)(?: [A-Z][A-Za-z]+){0,2}) (Damage|Support)\b", seg):
+            if name not in [c[1] for c in cards]:
+                cards.append((tier, name, role))
+    codes_txt = _aa_page_text("Codes")
+    active_seg = ""
+    if codes_txt:
+        i = codes_txt.lower().find("active")
+        active_seg = codes_txt[i:i + 1600] if i >= 0 else codes_txt[:1600]
+    cc = _aa_codes_crosscheck(active_seg) if active_seg else ""
+    both: list[str] = []
+    only_bee: list[str] = []
+    rewards: dict[str, str] = {}
+    lv_note: dict[str, str] = {}
+    if cc:
+        m = re.search(r"複数サイトで一致（確認済み）: (.+)", cc)
+        if m:
+            both = [c.strip() for c in m.group(1).split("、") if c.strip()]
+        m = re.search(r"Beebomのみ掲載: (.+)", cc)
+        if m:
+            only_bee = [c.strip() for c in m.group(1).split("、") if c.strip()]
+        for code, rw in re.findall(r"([A-Z][A-Z0-9]{4,}): Free (.+?)(?= \(NEW| [A-Z][A-Z0-9]{4,}:|$)", cc):
+            rewards[code] = rw.strip()
+        for code, rw, lv in re.findall(r"([A-Z][A-Z0-9]{4,}): Free ([^()]{2,60}?)\s*\(NEW, requires level (\d+)\+\)", cc):
+            lv_note[code] = lv
+            rewards.setdefault(code, rw.strip())
+    if not cards and not both and not only_bee:
+        return None
+    # バージョンと開始日
+    ver = ""
+    if seg:
+        m = re.search(r"New UPD ([0-9.]+)", seg)
+        if m:
+            ver = m.group(1)
+    date_s = ""
+    if seg:
+        m = re.search(r"arrived on ([A-Z][a-z]+) (\d+)", seg)
+        if m and m.group(1) in _MONTHS:
+            date_s = f"{_MONTHS[m.group(1)]}月{m.group(2)}日〜"
+    lines = [f"**アニメアドベンチャー UPD {ver}**" + (f"（{date_s}）" if date_s else "")]
+    if cards:
+        role_jp = {"Damage": "攻撃", "Support": "支援"}
+        lines.append(f"【新ユニット】{len(cards)}体＋シークレット3体")
+        for tier, name, role in cards:
+            lines.append(f"・{name}（{tier}ランク／{role_jp.get(role, role)}）")
+        if seg:
+            m = re.search(r"Summer banner has three Featured Mythics: ([^.]+)\.", seg)
+            if m:
+                feat = m.group(1).replace(" and ", "、")
+                cost = re.search(r"summon costs (\d+) SummerPearls", seg)
+                lines.append("サマーバナーの目玉ミシック: " + feat + (f"（1回{cost.group(1)} SummerPearls）" if cost else ""))
+    code_lines: list[str] = []
+    for c in both[:5]:
+        s = f"・{c}（複数サイトで確認済み）"
+        if c in rewards:
+            s += ": " + rewards[c]
+        code_lines.append(s)
+    for c in only_bee[:3]:
+        s = f"・{c}（Beebom掲載）"
+        if c in rewards:
+            s += ": " + rewards[c]
+        if c in lv_note:
+            s += f" ※レベル{lv_note[c]}以上"
+        code_lines.append(s)
+    if active_seg:
+        wiki_codes: list[str] = []
+        for c in re.findall(r"\b[A-Z][A-Z0-9]{4,}\b", active_seg):
+            if c not in wiki_codes and c not in both and c not in only_bee and c not in ("NEW",):
+                wiki_codes.append(c)
+        for c in wiki_codes[:3]:
+            code_lines.append(f"・{c}（Wiki掲載）")
+    if code_lines:
+        lines.append("【コード】")
+        lines.extend(code_lines)
+    # 次回アプデ（検索で日付らしい情報があれば）
+    nxt = ""
+    try:
+        r = _web_search("Anime Adventures next update release date")
+    except Exception:
+        r = ""
+    if r:
+        for ln in r.split("\n"):
+            if ("UPD 22" in ln or "Update 22" in ln or "next update" in ln.lower()) and re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|\d+月)", ln):
+                nxt = re.sub(r"\s*\(https?://.*$", "", ln).strip("・ ")[:120]
+                break
+    lines.append("【次回アプデ】" + (nxt if nxt else "海外サイトでもまだ日程は出てない"))
+    lines.append("情報元: Roblox公式・海外Wiki・英語ティアリストサイト・Beebom")
+    out = "\n".join(lines)
+    return out if len(out) <= 980 else out[:970] + "…"
 
 
 def _aa_context(text: str) -> str:
