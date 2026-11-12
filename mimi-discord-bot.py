@@ -226,7 +226,7 @@ def _system_prompt(user_id: int | None = None) -> str:
     return (
         AI_SYSTEM_PROMPT
         + f"今は{today}（日本時間）です。"
-        + "あなたは天気予報・ニュース・Web検索で調べものができて、頼まれればリマインダー（○分後に知らせる）もできます。"
+        + "あなたは天気予報・ニュース・Web検索で調べものができて、ゲームのアップデート情報も調べられます。頼まれればリマインダー（○分後に知らせる）もできます。"
         + "ユーザーの発言に【調べた情報】が付いていたら、その情報をもとに具体的に答えてください（数字や固有名詞は情報のものをそのまま使う）。"
         + "調べた情報が付いていない最新ニュースや天気は、知らないと正直に言ってください。"
         + (f"今話している相手の名前は「{user_names[user_id]}」です。たまに名前で呼んであげてください。" if user_id and user_names.get(user_id) else "")
@@ -630,23 +630,52 @@ def _strip_tags(x: str) -> str:
 
 
 def _web_search(query: str) -> str:
-    """DuckDuckGo（キー不要）でWeb検索し、上位のタイトル・要約・URLを返す。"""
+    """Web検索（DuckDuckGo→Lite→Bingの順に試す）で上位のタイトル・要約・URLを返す。"""
+    q = _urlparse.quote(query)
     try:
-        page = _http_get_text("https://html.duckduckgo.com/html/?q=" + _urlparse.quote(query))
+        page = _http_get_text("https://html.duckduckgo.com/html/?q=" + q)
+        titles = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
+        lines = []
+        for i, (href, title) in enumerate(titles[:5]):
+            url = href
+            qs = _urlparse.parse_qs(_urlparse.urlparse("https:" + href if href.startswith("//") else href).query)
+            if "uddg" in qs:
+                url = qs["uddg"][0]
+            snippet = _strip_tags(snippets[i]) if i < len(snippets) else ""
+            lines.append(f"・{_strip_tags(title)}: {snippet} ({url})")
+        if lines:
+            return "\n".join(lines)
     except Exception as e:
-        print(f"[調べもの] Web検索に失敗: {e}")
-        return ""
-    titles = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
-    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
-    lines = []
-    for i, (href, title) in enumerate(titles[:5]):
-        url = href
-        qs = _urlparse.parse_qs(_urlparse.urlparse("https:" + href if href.startswith("//") else href).query)
-        if "uddg" in qs:
-            url = qs["uddg"][0]
-        snippet = _strip_tags(snippets[i]) if i < len(snippets) else ""
-        lines.append(f"・{_strip_tags(title)}: {snippet} ({url})")
-    return "\n".join(lines)
+        print(f"[調べもの] Web検索（DDG）に失敗: {e}")
+    try:
+        page = _http_get_text("https://lite.duckduckgo.com/lite/?q=" + q)
+        titles = re.findall(r'class=.result-link.[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
+        snippets = re.findall(r'class="result-snippet"[^>]*>(.*?)</td>', page, re.S)
+        lines = []
+        for i, (href, title) in enumerate(titles[:5]):
+            snippet = _strip_tags(snippets[i]) if i < len(snippets) else ""
+            lines.append(f"・{_strip_tags(title)}: {snippet} ({href})")
+        if lines:
+            return "\n".join(lines)
+    except Exception as e:
+        print(f"[調べもの] Web検索（DDG Lite）に失敗: {e}")
+    try:
+        page = _http_get_text("https://www.bing.com/search?q=" + q)
+        blocks = re.findall(r'<li class="b_algo".*?</li>', page, re.S)
+        lines = []
+        for b in blocks[:5]:
+            tm = re.search(r'<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', b, re.S)
+            if not tm:
+                continue
+            sm = re.search(r"<p[^>]*>(.*?)</p>", b, re.S)
+            snippet = _strip_tags(sm.group(1)) if sm else ""
+            lines.append(f"・{_strip_tags(tm.group(2))}: {snippet} ({tm.group(1)})")
+        if lines:
+            return "\n".join(lines)
+    except Exception as e:
+        print(f"[調べもの] Web検索（Bing）に失敗: {e}")
+    return ""
 
 
 def _wiki_lookup(query: str) -> str:
@@ -767,8 +796,116 @@ def _news_lookup() -> str:
         return ""
 
 
+# ゲーム名の別名→英語名（検索用）と、更新ログWiki
+_GAME_ALIASES = {
+    "アニメヴァンガード": "Anime Vanguards",
+    "ヴァンガード": "Anime Vanguards",
+    "バンガード": "Anime Vanguards",
+    "ヴェンカード": "Anime Vanguards",
+}
+_GAME_WIKIS = {
+    "Anime Vanguards": "https://animevanguards.fandom.com/wiki/Update_Log",
+}
+
+
+# 既知のゲームはユニバースIDで直接引く（検索だと別ゲームや期間限定の改名に埋もれるため）
+_GAME_UNIVERSES = {
+    "Anime Vanguards": 5578556129,
+}
+
+
+def _roblox_game_info(title: str) -> str:
+    """Roblox公式APIでゲーム情報（名前・説明文・プレイ人数・更新日）を返す。"""
+    try:
+        uid = _GAME_UNIVERSES.get(title)
+        if uid:
+            g = _http_get_json(f"https://games.roblox.com/v1/games?universeIds={uid}")
+            gd = (g.get("data") or [{}])[0]
+            if gd:
+                lines = [
+                    f"Roblox公式ゲーム情報「{gd.get('name', '')}」（同時プレイ {gd.get('playing', 0)}人 / 最終更新 {str(gd.get('updated', ''))[:10]}）:"
+                ]
+                desc = (gd.get("description") or "").strip()
+                if desc:
+                    lines.append(desc[:1500])
+                return "\n".join(lines)
+        data = _http_get_json(
+            "https://apis.roblox.com/search-api/omni-search?searchQuery="
+            + _urlparse.quote(title) + "&sessionId=tempusbot"
+        )
+        contents = []
+        for group in data.get("searchResults", []):
+            if group.get("contentGroupType") == "Game":
+                contents.extend(group.get("contents", []))
+        if not contents:
+            return ""
+        tokens = [t for t in re.split(r"\s+", title.lower()) if len(t) >= 3]
+
+        def score(c):
+            n = (c.get("name") or "").lower()
+            return (sum(len(t) for t in tokens if t in n), c.get("playerCount", 0))
+
+        best = max(contents, key=score)
+        if score(best)[0] == 0:
+            return ""
+        lines = [f"Roblox公式ゲーム情報「{best.get('name', '')}」（同時プレイ {best.get('playerCount', 0)}人）:"]
+        desc = (best.get("description") or "").strip()
+        if desc:
+            lines.append(desc[:1500])
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[調べもの] Robloxゲーム情報の取得に失敗: {e}")
+        return ""
+
+
+def _game_update_lookup(text: str) -> str:
+    """ゲームの最新アップデート情報を、Roblox公式情報＋Web検索で集める。"""
+    title = text
+    for w in ("アップデート", "アプデ", "最新情報", "最新", "情報", "教えて", "知りたい", "調べて", "って何", "とは", "について", "の", "は", "を", "に", "？", "?", "！", "!", "。", "、", " "):
+        title = title.replace(w, "")
+    title = title.strip()
+    eng = _GAME_ALIASES.get(title, "")
+    if not eng:
+        for k, v in _GAME_ALIASES.items():
+            if k in text:
+                eng = v
+                break
+    parts = []
+    info = _roblox_game_info(eng or title)
+    if info:
+        parts.append(info)
+    name_for_search = eng or title
+    for q in (f'"{name_for_search}" update', f"{name_for_search} アップデート 最新"):
+        r = _web_search(q)
+        if not r:
+            continue
+        if eng:
+            kept = [ln for ln in r.split("\n") if "vanguard" in ln.lower()]
+            if not kept:
+                continue
+            r = "\n".join(kept)
+        parts.append(r)
+        break
+    wiki_url = _GAME_WIKIS.get(eng)
+    if wiki_url and not info:
+        try:
+            page = _http_get_text(wiki_url, timeout=12)
+            plain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S))
+            plain = re.sub(r"\s+", " ", plain)
+            m = re.search(r"(Update|アップデート)", plain)
+            seg = plain[m.start():m.start() + 1500] if m else plain[:1500]
+            if seg:
+                parts.append(f"Wiki更新ログ（{eng}）: {seg}")
+        except Exception as e:
+            print(f"[調べもの] Wiki更新ログの取得に失敗: {e}")
+    print(f"[調べもの] アプデ情報: {title or text} -> {eng or '-'}", flush=True)
+    return "\n".join(parts)
+
+
 def _lookup_context(text: str) -> tuple[str, str]:
     """発言内容を見て、必要な調べものを実行し (種類, 結果テキスト) を返す。"""
+    if "アプデ" in text or "アップデート" in text:
+        return "アプデ情報", _game_update_lookup(text)
     if "天気" in text:
         place = re.sub(r"(天気|予報|調べて|教えて|知りたい|今日|明日|明後日|現在|今|の|は|って|どう|かな|を|に|！|!|？|\?|。|、|\s)", "", text)
         if not place or len(place) > 10:
