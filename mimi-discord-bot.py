@@ -306,6 +306,8 @@ _FILIPINO_WORDS = {
     "kaibigan", "pamilya", "bahay", "trabaho", "pera", "tubig", "kanin", "masarap",
     "mabait", "masaya", "malungkot", "pagod", "gutom", "sige", "tara", "ingat",
     "paalam", "pasensya", "sandali", "mabilis", "mabagal", "malaki", "maliit",
+    "oo", "musta", "kain", "tulog", "gising", "laro", "lalaro", "kumain", "opo",
+    "teka", "halika", "kita", "niyo", "niya", "ito", "iyan", "iyon", "dito",
 }
 _LATIN_STRONG = {
     "salve", "ave", "gratias", "latine", "vale", "quid", "amicus", "amica", "ego",
@@ -326,6 +328,10 @@ _ENGLISH_WORDS = {
     "game", "update", "code", "news", "weather", "today", "tomorrow", "yesterday",
     "friend", "love", "like", "want", "need", "tell", "show", "give", "help",
     "play", "playing",
+    "ok", "okay", "yes", "yeah", "yep", "no", "nope", "sure", "wow", "cool", "nice",
+    "great", "sorry", "bye", "really", "very", "much", "more", "now", "go", "come",
+    "see", "know", "think", "about", "with", "for", "and", "but", "have", "has",
+    "will", "just", "let", "get", "got", "im", "me", "my", "we", "it", "its",
 }
 
 
@@ -382,13 +388,14 @@ def _requested_lang(text: str) -> str | None:
 
 
 def _note_user_lang(user_id: int, text: str) -> None:
-    """発言から言語を推定して、その人の返信言語として覚える。"""
+    """発言から言語を推定して、その人の返信言語として覚える（クラウドにも保存する）。"""
     if not user_id:
         return
     lang = _detect_lang(text)
     if lang and user_langs.get(user_id) != lang:
         user_langs[user_id] = lang
         print(f"[言語] 返信言語を {_LANG_NAMES.get(lang, lang)} に設定 (user={user_id})", flush=True)
+        _save_lang_bg(user_id, lang)
 
 
 def _system_prompt(user_id: int | None = None) -> str:
@@ -407,7 +414,7 @@ def _system_prompt(user_id: int | None = None) -> str:
         + (
             _LANG_INSTRUCTIONS[user_langs[user_id]]
             if user_id and user_langs.get(user_id) in _LANG_INSTRUCTIONS
-            else "相手が話しかけた言語（日本語・英語・フィリピン語・韓国語・ラテン語のいずれか）に合わせて、必ず同じ言語で返事をしてください。判定できないときは日本語で返事をしてください。ラテン語のときは古典ラテン語で返し、あとに短い日本語訳を添えてください。"
+            else "相手が話しかけた言語に合わせて、必ず同じ言語で返事をしてください。対応言語（日本語・英語・フィリピン語・韓国語・ラテン語）以外の言語で話しかけられた場合も、その言語で返事をしてください。判定できないときは日本語で返事をしてください。ラテン語のときは古典ラテン語で返し、あとに短い日本語訳を添えてください。"
         )
         + (f"今話している相手の名前は「{user_names[user_id]}」です。たまに名前で呼んであげてください。" if user_id and user_names.get(user_id) else "")
     )
@@ -801,6 +808,7 @@ async def smart_reply(user_id: int, text: str, image: tuple[bytes, str] | None =
     if req_lang and image is None:
         user_langs[user_id] = req_lang
         print(f"[言語] 切り替え希望で {_LANG_NAMES.get(req_lang, req_lang)} に設定 (user={user_id})", flush=True)
+        _save_lang_bg(user_id, req_lang)
         history = _ai_history[user_id]
         history.append(("user", text))
         history.append(("ai", _LANG_CONFIRMATIONS[req_lang]))
@@ -1587,35 +1595,45 @@ def _conversation_stats(guild_name: str = "") -> dict:
             "flagged": flagged, "reasons": reasons, "hours": hours}
 
 
-def _analysis_summary(guild_name: str = "") -> str:
-    """観測データの要約（第三者目線・客観的に、数字で示す）。"""
+_ANALYSIS_LABELS = {
+    "ja": {"title": "📊 会話の観測レポート（記録{n}件・第三者目線）", "empty": "観測データがまだないよ。サーバーで会話が進むと、ここに記録がたまっていくよ。", "top": "発言数トップ", "unit": "件", "channel": "一番活発なチャンネル", "hour": "一番活発な時間帯", "hour_suffix": "時台", "detected": "検知（スパム・暴言など）", "chart": "発言数トップ5", "count": "件数"},
+    "en": {"title": "📊 Conversation observation report ({n} messages recorded, third-person view)", "empty": "No observation data yet. Records will build up as people talk in the server.", "top": "Top talkers", "unit": " msgs", "channel": "Most active channel", "hour": "Most active hour", "hour_suffix": ":00", "detected": "Detections (spam, profanity, etc.)", "chart": "Top 5 talkers", "count": "messages"},
+    "fil": {"title": "📊 Ulat ng obserbasyon sa usapan ({n} mensahe ang naitala, third-person view)", "empty": "Wala pang datos ng obserbasyon. Maiipon ito habang nag-uusap ang mga tao sa server.", "top": "Pinakamaraming nagsalita", "unit": " mensahe", "channel": "Pinaka-aktibong channel", "hour": "Pinaka-aktibong oras", "hour_suffix": ":00", "detected": "Mga detection (spam, profanidad, atbp.)", "chart": "Top 5 na nagsalita", "count": "mensahe"},
+    "la": {"title": "📊 Relatio observationis colloquii ({n} nuntii conscripti, oculis tertiae personae)", "empty": "Nondum data observationis sunt. Dum homines in servo colloquuntur, data colligentur.", "top": "Qui plurima locuti sunt", "unit": "", "channel": "Canale frequentissimum", "hour": "Hora frequentissima", "hour_suffix": " hora", "detected": "Detectiones (spam, convicia, cetera)", "chart": "Quinque plurima locuti", "count": "nuntii"},
+    "ko": {"title": "📊 대화 관측 리포트 (기록 {n}건 · 제3자 시점)", "empty": "아직 관측 데이터가 없어. 서버에서 대화가 진행되면 여기에 기록이 쌓일 거야.", "top": "발언 수 TOP", "unit": "건", "channel": "가장 활발한 채널", "hour": "가장 활발한 시간대", "hour_suffix": "시", "detected": "감지 (스팸·폭언 등)", "chart": "발언 수 TOP 5", "count": "건수"},
+}
+
+
+def _analysis_summary(guild_name: str = "", lang: str = "ja") -> str:
+    """観測データの要約（第三者目線・客観的に、数字で示す）。lang で表示言語を変える。"""
+    lb = _ANALYSIS_LABELS.get(lang, _ANALYSIS_LABELS["ja"])
     st = _conversation_stats(guild_name)
     if st["total"] == 0:
-        return "観測データがまだないよ。サーバーで会話が進むと、ここに記録がたまっていくよ。"
-    lines = [f"📊 会話の観測レポート（記録{st['total']}件・第三者目線）"]
+        return lb["empty"]
+    lines = [lb["title"].format(n=st["total"])]
     top = st["users"].most_common(5)
-    lines.append("発言数トップ: " + "、".join(f"{u} {c}件" for u, c in top))
+    lines.append(lb["top"] + ": " + ", ".join(f"{u} {c}{lb['unit']}" for u, c in top))
     if st["channels"]:
         ch, cc = st["channels"].most_common(1)[0]
-        lines.append(f"一番活発なチャンネル: #{ch}（{cc}件）")
+        lines.append(f"{lb['channel']}: #{ch} ({cc}{lb['unit']})")
     if st["hours"]:
         h, hc = st["hours"].most_common(1)[0]
-        lines.append(f"一番活発な時間帯: {h}時台（{hc}件）")
+        lines.append(f"{lb['hour']}: {h}{lb['hour_suffix']} ({hc}{lb['unit']})")
     if st["flagged"]:
-        lines.append(f"検知（スパム・暴言など）: {len(st['flagged'])}件")
+        lines.append(f"{lb['detected']}: {len(st['flagged'])}{lb['unit']}")
         for r, c in st["reasons"].most_common(3):
-            lines.append(f"・{r}: {c}件")
+            lines.append(f"- {r}: {c}{lb['unit']}")
     else:
-        lines.append("検知（スパム・暴言など）: 0件")
+        lines.append(f"{lb['detected']}: 0{lb['unit']}")
     return "\n".join(lines)
 
 
-def _chart_png(labels: list[str], values: list[int], title: str) -> bytes | None:
+def _chart_png(labels: list[str], values: list[int], title: str, count_label: str = "件数") -> bytes | None:
     """棒グラフのPNGを作る（QuickChart）。失敗したら None。"""
     colors = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1"]
     cfg = {"type": "bar",
            "data": {"labels": labels,
-                    "datasets": [{"label": "件数", "data": values,
+                    "datasets": [{"label": count_label, "data": values,
                                   "backgroundColor": [colors[i % len(colors)] for i in range(len(values))]}]},
            "options": {"title": {"display": True, "text": title}, "legend": {"display": False},
                        "scales": {"yAxes": [{"ticks": {"beginAtZero": True}}]}}}
@@ -1630,14 +1648,15 @@ def _chart_png(labels: list[str], values: list[int], title: str) -> bytes | None
         return None
 
 
-def _analysis_reply(guild_name: str) -> tuple[str, bytes | None]:
-    """分析レポート本文と、発言数トップ5のグラフPNGを返す。"""
+def _analysis_reply(guild_name: str, lang: str = "ja") -> tuple[str, bytes | None]:
+    """分析レポート本文と、発言数トップ5のグラフPNGを返す（lang で表示言語を変える）。"""
+    lb = _ANALYSIS_LABELS.get(lang, _ANALYSIS_LABELS["ja"])
     st = _conversation_stats(guild_name)
-    summary = _analysis_summary(guild_name)
+    summary = _analysis_summary(guild_name, lang)
     png = None
     if st["total"] > 0 and st["users"]:
         top = st["users"].most_common(5)
-        png = _chart_png([u.split("#")[0] for u, _ in top], [c for _, c in top], "発言数トップ5")
+        png = _chart_png([u.split("#")[0] for u, _ in top], [c for _, c in top], lb["chart"], lb["count"])
     return summary, png
 
 
@@ -2115,6 +2134,77 @@ async def _restore_names_once() -> None:
         print("[記憶] 復元する名前はありませんでした", flush=True)
 
 
+# ---------- 言語設定のクラウド保存（再起動しても覚えているように） ----------
+_FS_LANGS_URL = (
+    f"https://firestore.googleapis.com/v1/projects/{_FS_PROJECT}"
+    f"/databases/(default)/documents/botlangs?key={_FS_API_KEY}"
+)
+_langs_loaded = False
+_LANG_CODES = ("ja", "en", "fil", "la", "ko")
+
+
+def _save_lang_to_cloud(user_id: int, lang: str) -> None:
+    """覚えた返信言語を Firestore に保存する（失敗しても例外を出さない）。"""
+    try:
+        fields = {
+            "ts": {"integerValue": str(int(time.time()))},
+            "user_id": {"integerValue": str(user_id)},
+            "lang": _fs_str(lang),
+        }
+        req = urllib.request.Request(
+            _FS_LANGS_URL,
+            data=json.dumps({"fields": fields}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp.read()
+        print(f"[言語] 言語設定をクラウドに保存しました: {lang}", flush=True)
+    except Exception as e:
+        print(f"[言語] 言語設定の保存に失敗: {e}", flush=True)
+
+
+def _save_lang_bg(user_id: int, lang: str) -> None:
+    threading.Thread(target=_save_lang_to_cloud, args=(user_id, lang), daemon=True).start()
+
+
+def _load_langs_from_cloud(limit: int = 200) -> dict[int, str]:
+    """保存済みの言語設定を読み戻す（ユーザーごとに最新のものを採用）。"""
+    try:
+        url = _FS_LANGS_URL + f"&pageSize={limit}&orderBy=ts%20desc"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        print(f"[言語] 言語設定の読み戻しに失敗: {e}", flush=True)
+        return {}
+    langs: dict[int, str] = {}
+    for doc in data.get("documents", []):
+        f = doc.get("fields", {})
+        try:
+            uid = int(f.get("user_id", {}).get("integerValue", "0") or 0)
+        except Exception:
+            uid = 0
+        lg = f.get("lang", {}).get("stringValue", "")
+        if uid and lg in _LANG_CODES and uid not in langs:
+            langs[uid] = lg
+    return langs
+
+
+async def _restore_langs_once() -> None:
+    """起動時に1回だけ、保存済みの言語設定を user_langs に復元する。"""
+    global _langs_loaded
+    if _langs_loaded:
+        return
+    _langs_loaded = True
+    langs = await asyncio.to_thread(_load_langs_from_cloud)
+    if langs:
+        user_langs.update(langs)
+        print(f"[言語] 言語設定を{len(langs)}件復元しました", flush=True)
+    else:
+        print("[言語] 復元する言語設定はありませんでした", flush=True)
+
+
 # ---------- 荒らし・メンバー監視 ----------
 _member_flag_times: dict[tuple[int, int], list[float]] = defaultdict(list)
 _member_channels: dict[tuple[int, int], list] = defaultdict(list)
@@ -2411,6 +2501,7 @@ async def on_ready():
     print(f"参加中のサーバー（{len(bot.guilds)}件）: {guild_names}", flush=True)
     asyncio.create_task(_restore_cloud_log_once())
     asyncio.create_task(_restore_names_once())
+    asyncio.create_task(_restore_langs_once())
     if not _maintenance_started:
         _maintenance_started = True
         asyncio.create_task(_maintenance_loop())
@@ -2526,7 +2617,9 @@ async def on_message(message: discord.Message):
             return
         if _is_analysis_request(clean):
             gname = message.guild.name if message.guild else ""
-            summary, png = await asyncio.to_thread(_analysis_reply, gname)
+            _note_user_lang(message.author.id, clean)
+            ulang = user_langs.get(message.author.id, "ja")
+            summary, png = await asyncio.to_thread(_analysis_reply, gname, ulang)
             print(f"[分析] 会話分析を返信（{gname or 'DM'}）", flush=True)
             await send_thoughtful_reply(message, summary, clean)
             if png:
