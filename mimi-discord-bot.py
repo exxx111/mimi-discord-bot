@@ -281,9 +281,14 @@ def _detect_lang(text: str) -> str | None:
     t = (text or "").strip()
     if not t:
         return None
-    if re.search(r"[가-힣]", t):
+    hangul = len(re.findall(r"[가-힣]", t))
+    kana = len(re.findall(r"[ぁ-ヿ]", t))
+    if hangul and kana:
+        # 日本語文の中で韓国語を引用しただけの場合は日本語として扱う
+        return "ko" if hangul > kana else "ja"
+    if hangul:
         return "ko"
-    if re.search(r"[ぁ-ヿ]", t):
+    if kana:
         return "ja"
     words = re.findall(r"[a-z']+", t.lower())
     if words:
@@ -489,7 +494,7 @@ async def ai_reply(user_id: int, text: str) -> str | None:
     history = _ai_history[user_id]
     reply: str | None = None
     ai_text = text
-    if _is_fortnite_question(text) and not _fortnite_has_strategy(text):
+    if _is_fortnite_question(text) and not _fortnite_has_strategy(text) and user_langs.get(user_id) in (None, "ja"):
         fixed_fn = await asyncio.to_thread(_fortnite_fixed_reply, text)
         if fixed_fn:
             print("[調べもの] Fortniteアプデ情報（固定形式で回答）", flush=True)
@@ -497,7 +502,7 @@ async def ai_reply(user_id: int, text: str) -> str | None:
             history.append(("ai", fixed_fn))
             del history[:-24]
             return fixed_fn
-    if _is_update_question(text):
+    if _is_update_question(text) and user_langs.get(user_id) in (None, "ja"):
         fixed = await asyncio.to_thread(_fixed_update_reply, text)
         if fixed:
             print("[調べもの] アプデ情報（固定形式で回答）", flush=True)
@@ -1057,7 +1062,7 @@ def _game_guide_lookup(eng: str) -> list[str]:
 # Epic公式系API（fortnite-api.com）＋日本語ニュース（FNJPNews、Xの公式発表・リークをまとめている）
 # ＋武器プール（fortnite.gg）＋次回アプデ予定（ロードマップまとめ）から集める。
 _FORTNITE_ALIASES = ("フォートナイト", "フォトナ", "Fortnite", "fortnite", "FORTNITE")
-_FORTNITE_STRATEGY_WORDS = ("降り", "着地", "武器", "立ち回り", "マップ", "おすすめ", "強い", "ティア", "有利", "勝ち方", "ビクロイ", "landing", "weapon", "rotation", "drop")
+_FORTNITE_STRATEGY_WORDS = ("降り", "着地", "武器", "立ち回り", "マップ", "強い", "ティア", "有利", "勝ち方", "ビクロイ", "landing", "weapon", "rotation", "drop")
 _FORTNITE_ITEM_WORDS = ("Potion", "Meat", "Med Kit", "Tangerine", "Bandage", "Slurp", "Chug", "Apple", "Fishing Rod", "Flopper", "Jellyfish", "Pepper", "Fish", "Fry", "Extractor", "Deployer", "Vault Key", "Grenade")
 
 
@@ -1066,10 +1071,11 @@ def _is_fortnite_question(text: str) -> bool:
     if not any(a in text for a in _FORTNITE_ALIASES):
         return False
     low = text.lower()
-    return ("アプデ" in text or "アップデート" in text or "次" in text
+    return ("アプデ" in text or "アップデート" in text or "次回" in text
+            or "次のアプデ" in text or bool(re.search(r"次.{0,4}(いつ|シーズン|チャプター)", text))
             or any(w in text for w in ("最新", "情報", "シーズン"))
             or any(w in text for w in _FORTNITE_STRATEGY_WORDS)
-            or any(w in low for w in ("update", "next", "best")))
+            or any(w in low for w in ("update", "next update", "best")))
 
 
 def _fortnite_has_strategy(text: str) -> bool:
@@ -1111,6 +1117,8 @@ def _fortnite_data() -> dict:
         mp = _http_get_json("https://fortnite-api.com/v1/map?language=ja", timeout=12)
         for p in ((mp.get("data") or {}).get("pois")) or []:
             nm = p.get("name", "")
+            if nm and "Rocky" in nm and "$" in nm:
+                nm = "A$AP Rockyの拠点"  # 公式APIの伏せ字表記（$.$. Rocky）を読みやすく直す
             if nm and "UnNamed" not in p.get("id", "") and nm != "宝箱" and nm not in d["pois"]:
                 d["pois"].append(nm)
     except Exception as e:
@@ -1414,6 +1422,21 @@ def _lookup_context(text: str) -> tuple[str, str]:
 
 # ---------- 会話の観測・分析（第三者目線・客観） ----------
 _ANALYSIS_WORDS = ("分析", "グラフ", "統計", "観測", "analyze", "analysis", "graph", "statistics", "분석", "그래프", "통계", "pagsusuri")
+
+
+def _is_analysis_request(text: str) -> bool:
+    """分析の依頼かどうか。「グラフィック」や「graphics」のような紛らわしい語では反応しない。"""
+    low = text.lower()
+    for w in _ANALYSIS_WORDS:
+        if w == "グラフ":
+            if re.search(r"グラフ(?!ィ)", text):
+                return True
+        elif w.isascii():
+            if re.search(r"\b" + re.escape(w) + r"\b", low):
+                return True
+        elif w in text:
+            return True
+    return False
 
 
 def _conversation_stats(guild_name: str = "") -> dict:
@@ -2367,7 +2390,7 @@ async def on_message(message: discord.Message):
             _schedule_reminder(message, seconds, note)
             await send_thoughtful_reply(message, f"おけ！{label}に知らせるね。", clean)
             return
-        if any(w in clean.lower() for w in _ANALYSIS_WORDS):
+        if _is_analysis_request(clean):
             gname = message.guild.name if message.guild else ""
             summary, png = await asyncio.to_thread(_analysis_reply, gname)
             print(f"[分析] 会話分析を返信（{gname or 'DM'}）", flush=True)
