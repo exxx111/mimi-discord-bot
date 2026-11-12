@@ -208,6 +208,59 @@ def _groq_models() -> list[str]:
     return GROQ_PREFERRED
 GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "").strip(), "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-flash-latest"] if m]
 _working_gemini_model: str | None = None
+
+# Geminiの404予防: 使えるモデルはAPIから取得し（Groqで効いた方式）、
+# 404になったモデルは覚えて二度と試さない。全部ダメなときはクールダウンして無駄な待ちをなくす。
+_gemini_models_cache: list[str] | None = None
+_gemini_dead_models: set[str] = set()
+_gemini_cooldown_until: float = 0.0
+_GEMINI_PREFERRED = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-flash-latest", "gemini-1.5-flash"]
+
+
+def _gemini_models() -> list[str]:
+    """このAPIキーで実際に使えるGeminiモデルをAPIから取得して、優先順に返す。"""
+    global _gemini_models_cache
+    if _gemini_models_cache:
+        return [m for m in _gemini_models_cache if m not in _gemini_dead_models]
+    models: list[str] = []
+    if GEMINI_API_KEY:
+        try:
+            req = urllib.request.Request(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                headers={"x-goog-api-key": GEMINI_API_KEY, "User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.load(resp)
+            for item in data.get("models", []):
+                name = (item.get("name") or "").replace("models/", "")
+                methods = item.get("supportedGenerationMethods") or []
+                if name and "generateContent" in methods and "gemini" in name:
+                    models.append(name)
+        except Exception as e:
+            print(f"[AI] Geminiのモデル一覧の取得に失敗: {e}", flush=True)
+    if models:
+        ordered = [m for m in _GEMINI_PREFERRED if m in models] + [m for m in models if m not in _GEMINI_PREFERRED]
+        _gemini_models_cache = ordered
+        print(f"[AI] Geminiで使えるモデル: {', '.join(ordered[:4])}", flush=True)
+        return [m for m in ordered if m not in _gemini_dead_models]
+    return [m for m in GEMINI_MODELS if m not in _gemini_dead_models]
+
+
+def _gemini_mark_dead(model: str, code: int) -> None:
+    """404（そのモデルは無い）になったモデルは覚えて、二度と試さない。"""
+    if code == 404 and model not in _gemini_dead_models:
+        _gemini_dead_models.add(model)
+        print(f"[AI] Geminiモデル {model} は404のため除外しました", flush=True)
+
+
+def _gemini_in_cooldown() -> bool:
+    return time.monotonic() < _gemini_cooldown_until
+
+
+def _gemini_start_cooldown() -> None:
+    global _gemini_cooldown_until
+    _gemini_cooldown_until = time.monotonic() + 1800
+    print("[AI] Geminiは連続失敗のため30分お休みします（その間はGroqだけで回答します）", flush=True)
 AI_SYSTEM_PROMPT = (
     "あなたはDiscordサーバーの見守りボット「tempus」です。"
     "相手の発言をよく読み、何を聞きたいのか・どんな気持ちなのかを考えてから返事をしてください。"
@@ -461,12 +514,16 @@ def _gemini_call(model: str, contents: list[dict], timeout: float = 20, user_id:
 
 
 def _gemini_generate(contents: list[dict], user_id: int | None = None) -> str:
-    """Geminiを呼ぶ。混雑時はモデルを替えながら最大約45秒粘る。"""
+    """Geminiを呼ぶ。使えるモデルだけを試し（404予防）、全部ダメならクールダウンする。"""
     global _working_gemini_model
+    if _gemini_in_cooldown():
+        raise RuntimeError("Gemini cooldown（連続失敗のためお休み中）")
     deadline = time.monotonic() + 45
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        candidates = ([_working_gemini_model] if _working_gemini_model else []) + [m for m in GEMINI_MODELS if m != _working_gemini_model]
+        candidates = ([_working_gemini_model] if _working_gemini_model and _working_gemini_model not in _gemini_dead_models else []) + [m for m in _gemini_models() if m != _working_gemini_model]
+        if not candidates:
+            break
         for model in candidates:
             remaining = deadline - time.monotonic()
             if remaining <= 3:
@@ -479,14 +536,17 @@ def _gemini_generate(contents: list[dict], user_id: int | None = None) -> str:
                 return text
             except urllib.error.HTTPError as e:
                 last_err = e
+                _gemini_mark_dead(model, e.code)
                 if e.code not in (400, 404, 429, 503):
                     raise
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = e
         if time.monotonic() + 6 < deadline:
             time.sleep(6)
-    assert last_err is not None
-    raise last_err
+    _gemini_start_cooldown()
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("Gemini: 使えるモデルがありません")
 
 
 async def ai_reply(user_id: int, text: str) -> str | None:
@@ -681,12 +741,17 @@ def _gemini_vision_call(model: str, prompt: str, mime: str, b64: str, timeout: f
 
 
 def _gemini_vision_generate(prompt: str, mime: str, data: bytes, user_id: int | None = None) -> str:
-    """画像つきでGeminiを呼ぶ。モデルを替えながら最大約40秒粘る。"""
+    """画像つきでGeminiを呼ぶ。使えるモデルだけを試し（404予防）、全部ダメならクールダウンする。"""
+    if _gemini_in_cooldown():
+        raise RuntimeError("Gemini cooldown（連続失敗のためお休み中）")
     b64 = base64.b64encode(data).decode("ascii")
     deadline = time.monotonic() + 40
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        for model in GEMINI_MODELS:
+        models = _gemini_models()
+        if not models:
+            break
+        for model in models:
             try:
                 text = _gemini_vision_call(model, prompt, mime, b64, timeout=20, user_id=user_id)
                 if text:
@@ -694,12 +759,14 @@ def _gemini_vision_generate(prompt: str, mime: str, data: bytes, user_id: int | 
                     return text
             except urllib.error.HTTPError as e:
                 last_err = e
+                _gemini_mark_dead(model, e.code)
                 if e.code not in (400, 404, 429, 503):
                     raise
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = e
         if time.monotonic() + 5 < deadline:
             time.sleep(5)
+    _gemini_start_cooldown()
     raise RuntimeError(f"Gemini vision failed: {last_err}")
 
 
@@ -1137,16 +1204,83 @@ def _fortnite_data() -> dict:
 
 
 def _fortnite_next_update() -> str:
-    """次回アプデの予定（ロードマップまとめサイトから日付を抽出）。無ければ ""。"""
+    """次回アプデの予定を複数の海外サイト＋予定表＋Web検索（Xの投稿を含む）から集めてまとめる。無ければ ""。"""
+    today = datetime.now(timezone(timedelta(hours=9))).date()
+    lines: list[str] = []
+    ch8_date = ""
+    ch8_sources = 0
+    # 海外まとめサイト1: esports.net（チャプター8ガイド）
     try:
         page = _http_get_text("https://www.esports.net/wiki/guides/fortnite-chapter-8/", timeout=12)
         plain = re.sub(r"\s+", " ", _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S)))
         m = re.search(r"Chapter 8 \(v(\d+\.\d+)\) is set to launch on ([A-Z][a-z]+) (\d+), (\d+)", plain)
         if m and m.group(2) in _MONTHS:
-            return f"次の大きなアプデはチャプター8（v{m.group(1)}）で、{_MONTHS[m.group(2)]}月{m.group(3)}日開始予定（ロードマップ／リークまとめ情報で、公式確定ではない）"
+            ch8_date = f"{_MONTHS[m.group(2)]}月{m.group(3)}日"
+            ch8_sources += 1
+            lines.append(f"次の大きなアプデはチャプター8（v{m.group(1)}）で、{ch8_date}開始予定")
     except Exception as e:
-        print(f"[調べもの] Fortnite次回アプデ取得に失敗: {e}", flush=True)
-    return ""
+        print(f"[調べもの] Fortnite次回アプデ取得に失敗(esports): {e}", flush=True)
+    # 海外まとめサイト2: Sportskeeda（2026ロードマップ）— 日付が一致するか照合し、その次の日付も拾う
+    try:
+        page = _http_get_text("https://opera.sportskeeda.com/fortnite/fortnite-2026-update-roadmap-revealed", timeout=12)
+        plain = re.sub(r"\s+", " ", _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S)))
+        m = re.search(r"Chapter 8 Season 1 is expected to start on ([A-Z][a-z]+) (\d+), (\d+)", plain)
+        if m and m.group(1) in _MONTHS:
+            d2 = f"{_MONTHS[m.group(1)]}月{m.group(2)}日"
+            if ch8_date and d2 == ch8_date:
+                ch8_sources += 1
+            elif not ch8_date:
+                ch8_date = d2
+                ch8_sources += 1
+                lines.append(f"次の大きなアプデはチャプター8で、{d2}開始予定")
+        m2 = re.search(r"Chapter 8 Season 1\s*[A-Z][a-z]+ \d+, \d{4}\s*([A-Z][a-z]+) (\d+), (\d{4})", plain)
+        if m2 and m2.group(1) in _MONTHS:
+            lines.append(f"その次の予定日として{_MONTHS[m2.group(1)]}月{m2.group(2)}日もロードマップに掲載")
+    except Exception as e:
+        print(f"[調べもの] Fortnite次回アプデ取得に失敗(sportskeeda): {e}", flush=True)
+    if lines and ch8_sources >= 2:
+        lines[0] += "（複数の海外サイトで一致）"
+    # 海外の予定表サイト: TechWiser（バージョンと日付の表から、未来の分だけ拾う）
+    try:
+        page = _http_get_text("https://techwiser.com/next-fortnite-update/", timeout=12)
+        plain = re.sub(r"\s+", " ", _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S)))
+        seen_v: set[str] = set()
+        for vm in re.finditer(r"v(\d+)\.(\d+)([A-Z][a-z]+) (\d+)(?:st|nd|rd|th), (\d{4})", plain):
+            if vm.group(3) not in _MONTHS:
+                continue
+            d = datetime(int(vm.group(5)), _MONTHS[vm.group(3)], int(vm.group(4))).date()
+            ver = f"{vm.group(1)}.{vm.group(2)}"
+            if d > today and ver not in seen_v:
+                seen_v.add(ver)
+                lines.append(f"v{ver}は{d.month}月{d.day}日予定（海外の予定表サイト）")
+            if len(seen_v) >= 2:
+                break
+    except Exception as e:
+        print(f"[調べもの] Fortnite次回アプデ取得に失敗(techwiser): {e}", flush=True)
+    # Web検索（Xの公式・リーカーの投稿が混ざる）から、日付つきの新しい話題を拾う
+    try:
+        for q in ("Fortnite next update date", "フォートナイト 次回アップデート いつ"):
+            r = _web_search(q)
+            if not r:
+                continue
+            for ln in r.split("\n"):
+                ln = re.sub(r"\s*\(https?://.*$", "", ln).strip("・ ")
+                if not ln or len(ln) < 12:
+                    continue
+                if not re.search(r"(November|December|1[12]月\d+日|Chapter 8|チャプター8)", ln):
+                    continue
+                if ch8_date and ("November 28" in ln or "11月28日" in ln):
+                    continue  # チャプター8の日付は上の行でまとめ済み
+                lines.append(f"Web検索より: {ln[:110]}")
+                break
+            if len(lines) >= 5:
+                break
+    except Exception as e:
+        print(f"[調べもの] Fortnite次回アプデ取得に失敗(検索): {e}", flush=True)
+    lines = lines[:4]
+    if lines:
+        lines.append("※予定・リーク系の情報で、公式確定ではない")
+    return "\n".join(lines)
 
 
 def _fortnite_jp_news() -> list[str]:
@@ -1231,7 +1365,7 @@ def _fortnite_fixed_reply(text: str) -> str | None:
         lines.append("📍 今のマップの地名")
         lines.append("、".join(d["pois"]))
         lines.append("")
-    lines.append("情報元：Epic公式系API・日本語ニュース（Xの公式発表まとめ）")
+    lines.append("情報元：Epic公式系API・日本語ニュース（Xの公式発表まとめ）・海外まとめサイト複数・Web検索")
     lines.append("降り場・武器・立ち回りのおすすめは「フォートナイト 降りる場所 おすすめ」みたいに聞いてね")
     return "\n".join(lines)[:980]
 
