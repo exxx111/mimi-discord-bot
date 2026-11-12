@@ -200,15 +200,16 @@ GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "").strip(), "gemini
 _working_gemini_model: str | None = None
 AI_SYSTEM_PROMPT = (
     "あなたはDiscordサーバーの見守りボット「tempus」です。"
-    "相手の言った内容にちゃんと向き合って、考えてから返事をしてください。"
-    "質問には具体的に答え、あいまいな相づちだけで済ませないでください。"
-    "会話の流れ（今までのやりとり）を踏まえて、文脈に合った返事をしてください。"
-    "長さは2〜4文くらいが目安です。長文や箇条書きは避けて、ふつうの会話らしく。"
+    "相手の発言をよく読み、何を聞きたいのか・どんな気持ちなのかを考えてから返事をしてください。"
+    "質問には具体的に、理由や例も添えて答えてください。あいまいな相づちだけで済ませないでください。"
+    "会話の流れ（今までのやりとり）を必ず踏まえ、前に出た話題・相手の好きなもの・状況を覚えていて、自然に触れてください。"
+    "雑談は短く楽しく、説明を求められたらしっかり長めに（最大で600字くらい、必要なら箇条書きも可）答えてください。"
+    "分からないことは正直に「わかんないや」と言い、推測のときは「たぶん」と断ってください。うそはつかないでください。"
+    "同じ言い回しを繰り返さず、ときどき相手に質問して会話を続けてください。"
     "明るくフレンドリーに、日本語で答えてください。"
     "サーバーの安全を見守るのが仕事で、スパムや禁止ワードを見つけてログに記録しています。"
-    "知らないことは正直に「わかんないや」と言ってください。うそはつかないでください。"
 )
-def _system_prompt() -> str:
+def _system_prompt(user_id: int | None = None) -> str:
     """AI_SYSTEM_PROMPT に今日の日付と調べものの指示を足したもの。"""
     now = datetime.now(timezone(timedelta(hours=9)))
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
@@ -219,6 +220,7 @@ def _system_prompt() -> str:
         + "あなたは天気予報・ニュース・Web検索で調べものができて、頼まれればリマインダー（○分後に知らせる）もできます。"
         + "ユーザーの発言に【調べた情報】が付いていたら、その情報をもとに具体的に答えてください（数字や固有名詞は情報のものをそのまま使う）。"
         + "調べた情報が付いていない最新ニュースや天気は、知らないと正直に言ってください。"
+        + (f"今話している相手の名前は「{user_names[user_id]}」です。たまに名前で呼んであげてください。" if user_id and user_names.get(user_id) else "")
     )
 
 
@@ -226,9 +228,7 @@ def _system_prompt() -> str:
 _ai_history: dict[int, list[tuple[str, str]]] = defaultdict(list)
 
 
-def _groq_call(model: str, messages: list[dict], timeout: float = 20) -> str:
-    """GroqのLLMを1回呼ぶ（OpenAI互換API）。"""
-    payload = {"model": model, "messages": messages, "max_tokens": 800, "temperature": 0.9}
+def _groq_post(payload: dict, timeout: float) -> str:
     req = urllib.request.Request(
         "https://api.groq.com/openai/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -240,9 +240,23 @@ def _groq_call(model: str, messages: list[dict], timeout: float = 20) -> str:
     return (data["choices"][0]["message"]["content"] or "").strip()
 
 
-def _groq_generate(history: list[tuple[str, str]], text: str) -> str:
+def _groq_call(model: str, messages: list[dict], timeout: float = 20) -> str:
+    """GroqのLLMを1回呼ぶ（OpenAI互換API）。"""
+    payload = {"model": model, "messages": messages, "max_tokens": 1600, "temperature": 0.8}
+    if "gpt-oss" in model:
+        payload["reasoning_effort"] = "high"  # 推論を深くして、賢く答える
+    try:
+        return _groq_post(payload, timeout)
+    except urllib.error.HTTPError as e:
+        if "reasoning_effort" in payload and e.code == 400:
+            payload.pop("reasoning_effort")  # 対応していない場合は付けずに再試行
+            return _groq_post(payload, timeout)
+        raise
+
+
+def _groq_generate(history: list[tuple[str, str]], text: str, user_id: int | None = None) -> str:
     """Groqで返事を作る。混雑時はモデルを替えながら少し粘る。"""
-    messages = [{"role": "system", "content": _system_prompt()}]
+    messages = [{"role": "system", "content": _system_prompt(user_id)}]
     for who, body in history:
         messages.append({"role": "user" if who == "user" else "assistant", "content": body})
     messages.append({"role": "user", "content": text})
@@ -271,18 +285,18 @@ def _groq_generate(history: list[tuple[str, str]], text: str) -> str:
     raise RuntimeError(f"{last_err} / {detail}")
 
 
-def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
+def _gemini_call(model: str, contents: list[dict], timeout: float = 20, user_id: int | None = None) -> str:
     """指定モデルでGemini APIをストリーミング呼び出しする。
 
     完成まで待つ方式だと混雑時に読み取りタイムアウトになるため、
     少しずつ流れてくる方式（SSE）で受け取る。2.5系は思考をオフにして速くする。
     """
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse"
-    gen_config: dict = {"maxOutputTokens": 800, "temperature": 0.9}
+    gen_config: dict = {"maxOutputTokens": 1600, "temperature": 0.8}
     if model.startswith("gemini-2.5"):
         gen_config["thinkingConfig"] = {"thinkingBudget": 0}
     payload = {
-        "system_instruction": {"parts": [{"text": _system_prompt()}]},
+        "system_instruction": {"parts": [{"text": _system_prompt(user_id)}]},
         "contents": contents,
         "generationConfig": gen_config,
     }
@@ -310,7 +324,7 @@ def _gemini_call(model: str, contents: list[dict], timeout: float = 20) -> str:
     return "".join(texts).strip()
 
 
-def _gemini_generate(contents: list[dict]) -> str:
+def _gemini_generate(contents: list[dict], user_id: int | None = None) -> str:
     """Geminiを呼ぶ。混雑時はモデルを替えながら最大約45秒粘る。"""
     global _working_gemini_model
     deadline = time.monotonic() + 45
@@ -322,7 +336,7 @@ def _gemini_generate(contents: list[dict]) -> str:
             if remaining <= 3:
                 break
             try:
-                text = _gemini_call(model, contents, timeout=min(20.0, remaining))
+                text = _gemini_call(model, contents, timeout=min(20.0, remaining), user_id=user_id)
                 if _working_gemini_model != model:
                     _working_gemini_model = model
                     print(f"[AI] 使用モデル: Gemini {model}")
@@ -349,7 +363,7 @@ async def ai_reply(user_id: int, text: str) -> str | None:
         ai_text = f"【調べた情報】\n{ctx}\n\n【ユーザーの発言】\n{text}"
     if GROQ_API_KEY:
         try:
-            reply = await asyncio.to_thread(_groq_generate, list(history), ai_text)
+            reply = await asyncio.to_thread(_groq_generate, list(history), ai_text, user_id)
         except Exception as e:
             print(f"[AI] Groq呼び出しに失敗: {e}")
     if not reply and GEMINI_API_KEY:
@@ -358,15 +372,15 @@ async def ai_reply(user_id: int, text: str) -> str | None:
             for who, body in history
         ] + [{"role": "user", "parts": [{"text": ai_text}]}]
         try:
-            reply = await asyncio.to_thread(_gemini_generate, contents)
+            reply = await asyncio.to_thread(_gemini_generate, contents, user_id)
         except Exception as e:
             print(f"[AI] Gemini呼び出しに失敗: {e}")
     if not reply:
         return None
     history.append(("user", text))
     history.append(("ai", reply))
-    del history[:-12]  # 直近のやりとりだけ覚える
-    return reply[:500]
+    del history[:-24]  # 直近のやりとりだけ覚える
+    return reply[:1000]
 
 
 async def smart_reply(user_id: int, text: str) -> str:
@@ -376,6 +390,7 @@ async def smart_reply(user_id: int, text: str) -> str:
         name = m.group(1).strip(" 　です。、")[:20]
         if name:
             user_names[user_id] = name
+            _save_name_bg(user_id, name)
             return f"{name}って言うんだね！覚えたよ♪ よろしく、{name}！"
     if GROQ_API_KEY or GEMINI_API_KEY:
         reply = await ai_reply(user_id, text)
@@ -719,6 +734,7 @@ def chat_reply(user_id: int, text: str) -> str | None:
     m = re.search(r"(?:名前は|なまえは)\s*([^\s、。！!？?]{1,12})", t) or re.search(r"([^\s、。！!？?]{1,12})って呼んで", t)
     if m:
         user_names[user_id] = m.group(1)
+        _save_name_bg(user_id, m.group(1))
         return f"わかった！これからは **{m.group(1)}** って呼ぶね♪ 覚えたよ！"
     if "名前" in t and ("覚えて" in t or "なんだっけ" in t or "何だっけ" in t):
         name = user_names.get(user_id)
@@ -968,6 +984,76 @@ async def _restore_cloud_log_once() -> None:
         print(f"[ログ保存] 過去の検知を{len(restored)}件復元しました", flush=True)
     else:
         print("[ログ保存] 復元する過去の検知はありませんでした", flush=True)
+
+
+# ---------- 名前のクラウド保存（再起動しても覚えているように） ----------
+_FS_NAMES_URL = (
+    f"https://firestore.googleapis.com/v1/projects/{_FS_PROJECT}"
+    f"/databases/(default)/documents/botnames?key={_FS_API_KEY}"
+)
+_names_loaded = False
+
+
+def _save_name_to_cloud(user_id: int, name: str) -> None:
+    """覚えた名前を Firestore に保存する（失敗しても例外を出さない）。"""
+    try:
+        fields = {
+            "ts": {"integerValue": str(int(time.time()))},
+            "user_id": {"integerValue": str(user_id)},
+            "name": _fs_str(name),
+        }
+        req = urllib.request.Request(
+            _FS_NAMES_URL,
+            data=json.dumps({"fields": fields}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp.read()
+        print(f"[記憶] 名前をクラウドに保存しました: {name}", flush=True)
+    except Exception as e:
+        print(f"[記憶] 名前の保存に失敗: {e}", flush=True)
+
+
+def _save_name_bg(user_id: int, name: str) -> None:
+    threading.Thread(target=_save_name_to_cloud, args=(user_id, name), daemon=True).start()
+
+
+def _load_names_from_cloud(limit: int = 200) -> dict[int, str]:
+    """保存済みの名前を読み戻す（ユーザーごとに最新の名前を採用）。"""
+    try:
+        url = _FS_NAMES_URL + f"&pageSize={limit}&orderBy=ts%20desc"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        print(f"[記憶] 名前の読み戻しに失敗: {e}", flush=True)
+        return {}
+    names: dict[int, str] = {}
+    for doc in data.get("documents", []):
+        f = doc.get("fields", {})
+        try:
+            uid = int(f.get("user_id", {}).get("integerValue", "0") or 0)
+        except Exception:
+            uid = 0
+        nm = f.get("name", {}).get("stringValue", "")
+        if uid and nm and uid not in names:
+            names[uid] = nm
+    return names
+
+
+async def _restore_names_once() -> None:
+    """起動時に1回だけ、保存済みの名前を user_names に復元する。"""
+    global _names_loaded
+    if _names_loaded:
+        return
+    _names_loaded = True
+    names = await asyncio.to_thread(_load_names_from_cloud)
+    if names:
+        user_names.update(names)
+        print(f"[記憶] 名前を{len(names)}件復元しました", flush=True)
+    else:
+        print("[記憶] 復元する名前はありませんでした", flush=True)
 
 
 # ---------- 荒らし・メンバー監視 ----------
@@ -1244,6 +1330,7 @@ async def on_ready():
     guild_names = " / ".join(g.name for g in bot.guilds) or "なし"
     print(f"参加中のサーバー（{len(bot.guilds)}件）: {guild_names}", flush=True)
     asyncio.create_task(_restore_cloud_log_once())
+    asyncio.create_task(_restore_names_once())
     if not _maintenance_started:
         _maintenance_started = True
         asyncio.create_task(_maintenance_loop())
