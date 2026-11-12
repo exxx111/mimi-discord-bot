@@ -1582,12 +1582,30 @@ def _aa_unit_reply(text: str) -> str | None:
     return out
 
 
+def _aa_new_units() -> str:
+    """英語ティアリストサイトの「New UPD ○ units」欄から新ユニット情報を取る。"""
+    try:
+        page = _http_get_text("https://tierlistanimeadventures.com/units/", timeout=12)
+    except Exception as e:
+        print(f"[調べもの] AA新ユニット取得に失敗: {e}", flush=True)
+        return ""
+    plain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S))
+    plain = re.sub(r"\s+", " ", plain)
+    m = re.search(r"New UPD [0-9.]+ units", plain)
+    if not m:
+        return ""
+    return plain[m.start():m.start() + 1500]
+
+
 def _aa_context(text: str) -> str:
     """アニメアドベンチャーの情報・アプデ・次回アプデ用の調べもの材料を集める。"""
     parts = []
     info = _roblox_game_info("Anime Adventures")
     if info:
         parts.append(info)
+    units = _aa_new_units()
+    if units:
+        parts.append("新ユニット情報（英語サイト）:\n" + units)
     codes = _aa_page_text("Codes")
     if codes:
         i = codes.lower().find("active")
@@ -1600,13 +1618,16 @@ def _aa_context(text: str) -> str:
             t = _aa_page_text(titles[0])
             if t:
                 parts.append(f"キャラ「{titles[0]}」のWiki情報（英語）:\n" + t[:1800])
-    for q in ("Anime Adventures update 21 new units patch notes", "Anime Adventures next update update 22"):
+    for q in ("Anime Adventures UPD 21 update new units codes", "Anime Adventures next update release date"):
         try:
             r = _web_search(q)
-            if r:
-                parts.append(f"Web検索「{q}」:\n" + r)
         except Exception:
-            pass
+            r = ""
+        if r:
+            # 無関係な「アニメ配信サイト」等のノイズを除き、ゲーム名を含む行だけ残す
+            kept = [ln for ln in r.split("\n") if "Anime Adventures" in ln or "UPD 2" in ln]
+            if kept:
+                parts.append(f"Web検索「{q}」:\n" + "\n".join(kept[:6]))
     return "\n\n".join(parts)
 
 
