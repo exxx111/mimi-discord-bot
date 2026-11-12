@@ -410,6 +410,7 @@ def _system_prompt(user_id: int | None = None) -> str:
         + "ユーザーの発言に【調べた情報】が付いていたら、その情報をもとに具体的に答えてください（数字や固有名詞は情報のものをそのまま使う）。観測データ（サーバーの会話ログの集計）が付いていたら、第三者目線で客観的に、数字をもとに分析して答えてください。"
         + "ゲームのアップデート情報のときは、最初に「アップデート名（日付）」、次にコードがあれば「コード名：報酬」を箇条書き、新ユニット、新要素の順で、短い箇条書き中心にまとめてください。情報に無いコードやユニット名は絶対に作らないでください。"
         + "フォートナイトの情報が付いていたら、最初に現在のバージョンと最新ニュース、次に次のアプデ予定、次におすすめの降り場（地名リストの中から、激戦区と安定降りを理由つきで1つずつ）、強い武器（武器プールの中からだけ選ぶ）、有利な立ち回り（序盤・中盤・終盤）の順で答えてください。情報に無いバージョン・日付・武器名・地名は作らないでください。予定やリークの話は、公式確定ではないと分かるように書いてください。"
+        + "アニメアドベンチャーの情報が付いていたら、【最新アプデ】【新ユニット】【コード】【次回アプデ】の見出しに分けて答えてください。キャラの情報が付いていたら【キャラ詳細】【覚醒（進化）素材】【素材の入手先】に分けて答えてください。情報に無いユニット名・素材・入手先は作らないでください。"
         + "調べた情報が付いていない最新ニュースや天気は、知らないと正直に言ってください。"
         + (
             _LANG_INSTRUCTIONS[user_langs[user_id]]
@@ -561,6 +562,14 @@ async def ai_reply(user_id: int, text: str) -> str | None:
     history = _ai_history[user_id]
     reply: str | None = None
     ai_text = text
+    if _is_aa_question(text) and user_langs.get(user_id) in (None, "ja"):
+        fixed_aa = await asyncio.to_thread(_aa_unit_reply, text)
+        if fixed_aa:
+            print("[調べもの] アニメアドベンチャー（キャラ固定形式で回答）", flush=True)
+            history.append(("user", text))
+            history.append(("ai", fixed_aa))
+            del history[:-24]
+            return fixed_aa
     if _is_fortnite_question(text) and not _fortnite_has_strategy(text) and user_langs.get(user_id) in (None, "ja"):
         fixed_fn = await asyncio.to_thread(_fortnite_fixed_reply, text)
         if fixed_fn:
@@ -1042,6 +1051,7 @@ _GAME_WIKIS = {
 # 既知のゲームはユニバースIDで直接引く（検索だと別ゲームや期間限定の改名に埋もれるため）
 _GAME_UNIVERSES = {
     "Anime Vanguards": 5578556129,
+    "Anime Adventures": 3183403065,
 }
 
 
@@ -1378,6 +1388,228 @@ def _fortnite_fixed_reply(text: str) -> str | None:
     return "\n".join(lines)[:980]
 
 
+# ---------- アニメアドベンチャー（Roblox） ----------
+# 情報元: Roblox公式API + 海外Wiki（Anime Adventures Wiki / Fandom）のAPI + Web検索。
+# キャラ名を言われたら、詳細・覚醒（進化）素材・素材の入手先を分けて固定形式で返す。
+_AA_API = "https://anime-adventures.fandom.com/api.php"
+_AA_ALIASES = ("アニメアドベンチャー", "アニメアドベンチャーズ", "Anime Adventures", "anime adventures")
+_AA_NAME_SEEDS = {
+    "ルフィ": "Luffy", "ゾロ": "Zoro", "サンジ": "Sanji", "ナミ": "Nami", "チョッパー": "Chopper",
+    "エース": "Ace", "ロー": "Law", "シャンクス": "Shanks", "ミホーク": "Mihawk", "カイドウ": "Kaido",
+    "キャプテン": "Captain",
+    "悟空": "Goku", "ゴクウ": "Goku", "ベジータ": "Vegeta", "悟飯": "Gohan",
+    "ナルト": "Naruto", "サスケ": "Sasuke", "サクラ": "Sakura", "カカシ": "Kakashi", "ヒナタ": "Hinata",
+    "五条悟": "Gojo", "五条": "Gojo", "宿儺": "Sukuna", "虎杖": "Yuji", "虎杖悠仁": "Yuji",
+    "伏黒": "Megumi", "伏黒恵": "Megumi", "釘崎": "Nobara",
+    "炭治郎": "Tanjiro", "竈門炭治郎": "Tanjiro", "禰豆子": "Nezuko", "善逸": "Zenitsu",
+    "伊之助": "Inosuke", "煉獄": "Rengoku", "煉獄杏寿郎": "Rengoku",
+    "エレン": "Eren", "ミカサ": "Mikasa", "リヴァイ": "Levi",
+    "デク": "Deku", "緑谷": "Deku", "爆豪": "Bakugo", "轟": "Todoroki",
+    "ゴン": "Gon", "キルア": "Killua", "クラピカ": "Kurapika", "ヒソカ": "Hisoka",
+    "ジョルノ": "Giorno", "承太郎": "Jotaro", "ディオ": "Dio",
+    "アスタ": "Asta", "ユノ": "Yuno", "一護": "Ichigo", "ルキア": "Rukia",
+}
+_AA_SKIP_TITLES = ("Disambiguation", "Tier List", "Unit List", "Update Log", "Codes", "Items", "Events", "Wiki", "FAQ", "Frequently")
+_aa_items_cache: str | None = None
+
+
+def _is_aa_question(text: str) -> bool:
+    return any(a in text for a in _AA_ALIASES)
+
+
+def _aa_unit_query(text: str) -> str:
+    """発言からキャラ名（検索用）を取り出す。キャラの話でなければ "" を返す。"""
+    t = text
+    for jp in sorted(_AA_NAME_SEEDS, key=len, reverse=True):
+        if jp in t:
+            return _AA_NAME_SEEDS[jp]
+    for a in _AA_ALIASES:
+        t = t.replace(a, " ")
+    for w in ("覚醒素材", "進化素材", "覚醒", "進化", "エボリューション", "素材", "詳細", "情報",
+              "アプデ", "アップデート", "次の", "次回", "最新", "コード", "教えて", "について",
+              "キャラ", "キャラクター", "ユニット", "どこ", "貰える", "もらえる", "入手",
+              "の", "を", "が", "は", "って", "です", "か", "？", "?", "！", "!", "、", "。"):
+        t = t.replace(w, " ")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _aa_search(query: str, limit: int = 6) -> list[str]:
+    try:
+        d = _http_get_json(_AA_API + "?" + _urlparse.urlencode(
+            {"action": "query", "list": "search", "srsearch": query, "srlimit": limit, "format": "json"}), timeout=15)
+        return [s.get("title", "") for s in d.get("query", {}).get("search", []) if s.get("title")]
+    except Exception as e:
+        print(f"[調べもの] AA Wiki検索に失敗: {e}", flush=True)
+        return []
+
+
+def _aa_page_text(title: str) -> str:
+    try:
+        d = _http_get_json(_AA_API + "?" + _urlparse.urlencode(
+            {"action": "parse", "page": title, "prop": "text", "format": "json"}), timeout=15)
+        h = d["parse"]["text"]["*"]
+        t = re.sub(r"<script.*?</script>|<style.*?</style>", "", h, flags=re.S)
+        t = _html.unescape(re.sub(r"<[^>]+>", " ", t))
+        return re.sub(r"\s+", " ", t)
+    except Exception as e:
+        print(f"[調べもの] AA Wikiページ取得に失敗({title}): {e}", flush=True)
+        return ""
+
+
+def _aa_items_text() -> str:
+    global _aa_items_cache
+    if _aa_items_cache is None:
+        _aa_items_cache = _aa_page_text("Items")
+    return _aa_items_cache
+
+
+# 調べた範囲で確認できた素材の入手先（WikiのItemsページに載っていないもの）
+_AA_SOURCE_OVERRIDES = {
+    "SMILE Fruit": "Puppet IslandのInfiniteモード／Puppetポータル／Operatorのデイリーミッション（英語ガイドサイト情報）",
+}
+
+
+def _aa_material_source(name: str) -> str:
+    """素材の入手先を、確認済み情報→WikiのItemsページ→Web検索の順に探す。見つからなければ ""。"""
+    if name in _AA_SOURCE_OVERRIDES:
+        return _AA_SOURCE_OVERRIDES[name]
+    items = _aa_items_text()
+    if items:
+        i = items.find(name)
+        if i >= 0:
+            seg = items[i + len(name): i + len(name) + 240].strip(" :：-")
+            seg = seg.split("You can hold")[0].strip()
+            seg = seg.replace("Used for crafting evolution items. ", "").replace("Used for crafting evolution items.", "")
+            if len(seg) >= 10:
+                return seg[:80]
+    if "Star Fruit" in name and name != "Star Fruit":
+        return _aa_material_source("Star Fruit")
+    keys = [name.split(" ")[0], name.split(" ")[-1]]
+    for qname in ([name, "Fake Fruit"] if name == "SMILE Fruit" else [name]):
+        try:
+            r = _web_search(f"Anime Adventures {qname} how to get")
+        except Exception:
+            r = ""
+        if r:
+            for ln in r.split("\n"):
+                ln = re.sub(r"\s*\(https?://.*$", "", ln).strip("・ ")
+                if any(k in ln for k in keys) and len(ln) >= 15:
+                    return ln[:80]
+    return ""
+
+
+def _aa_unit_reply(text: str) -> str | None:
+    """キャラ名から、詳細・覚醒素材・素材の入手先を分けた固定形式の返事を作る。"""
+    query = _aa_unit_query(text)
+    if not query:
+        return None
+    want_evo = any(w in text for w in ("素材", "覚醒", "進化", "エボ"))
+    titles = [t for t in _aa_search(query) if not any(s in t for s in _AA_SKIP_TITLES)]
+    if not titles:
+        return None
+    q = query.lower()
+    titles.sort(key=lambda t: (t.lower() != q, not t.lower().startswith(q), len(t)))
+    chosen = None
+    chosen_txt = ""
+    for cand in titles[:4 if want_evo else 1]:
+        txt = _aa_page_text(cand)
+        if not txt:
+            continue
+        if chosen is None:
+            chosen, chosen_txt = cand, txt
+        if "can evolve into" in txt:
+            chosen, chosen_txt = cand, txt
+            break
+        if not want_evo:
+            break
+    if chosen is None:
+        return None
+    title, txt = chosen, chosen_txt
+    lines = [f"**{title}**（アニメアドベンチャー）", "【キャラ詳細】"]
+    m = re.search(re.escape(title) + r" is an?\s+([A-Za-z]+)", txt) or re.search(r"is an?\s+(Mythical|Secret|Legendary|Epic|Rare|Uncommon|Common)\b", txt)
+    if m:
+        lines.append(f"レア度: {m.group(1)}")
+    mo = re.search(r"obtainable through ([^.]*)\.", txt)
+    if mo:
+        seg = mo.group(1)
+        if "summon" in seg:
+            lines.append("入手: 召喚（ガチャ）")
+        else:
+            lines.append(f"入手: {seg.strip()[:60]}")
+    cost = re.search(r"Deployment Cost ([\d,]+)", txt)
+    total = re.search(r"Total Cost ([\d,]+)", txt)
+    if cost:
+        lines.append(f"配置コスト: {cost.group(1)}" + (f" / 総コスト: {total.group(1)}" if total else ""))
+    tt = re.search(r"Tower Type ([A-Za-z]+)", txt)
+    dt = re.search(r"Damage Type ([A-Za-z]+)", txt)
+    if tt or dt:
+        lines.append("タイプ: " + " / ".join(x for x in [tt.group(1) if tt else "", f"ダメージ {dt.group(1)}" if dt else ""] if x))
+    dmg = re.search(r"Damage ([\d,]+) -> ([\d,]+)", txt)
+    rng = re.search(r"Range ([\d.]+)", txt)
+    if dmg:
+        lines.append(f"ダメージ: {dmg.group(1)} → {dmg.group(2)}" + (f" / 射程: {rng.group(1)}" if rng else ""))
+    em = re.search(r"can evolve into (.+?) with the following materials: Required Items: (.+?) Result ", txt)
+    lines.append("【覚醒（進化）】")
+    if em:
+        evolved = em.group(1).strip()
+        mats = [(c.replace(",", ""), n.strip()) for c, n in re.findall(r"x([\d,]+)\s+(.+?)(?= x[\d,]+ |$)", em.group(2))]
+        lines.append(f"進化先: {evolved}")
+        tk = re.search(r"must have ([\d,]+) Takedowns", txt)
+        if tk:
+            lines.append(f"必要討伐数: {tk.group(1)}")
+        lines.append("必要素材:")
+        for c, n in mats:
+            lines.append(f"・{n} ×{c}")
+        srcs = []
+        for c, n in mats:
+            if n == title:
+                continue
+            src = _aa_material_source(n)
+            srcs.append(f"・{n}: {src}" if src else f"・{n}: （入手先はWikiで未確認）")
+        if srcs:
+            lines.append("【素材の入手先】")
+            lines.extend(srcs)
+    else:
+        lines.append("このキャラに進化はないみたい（Wikiに進化情報なし）")
+    lines.append("情報元: Anime Adventures Wiki（海外）")
+    out = "\n".join(lines)
+    if len(out) > 980:
+        # 素材が多いときは入手先の行を短くして、情報元まで収める
+        lines = [ln[:100] if ln.startswith("・") and ": " in ln else ln for ln in lines]
+        out = "\n".join(lines)
+    if len(out) > 980:
+        out = out[:950] + "\n情報元: Anime Adventures Wiki（海外）"
+    return out
+
+
+def _aa_context(text: str) -> str:
+    """アニメアドベンチャーの情報・アプデ・次回アプデ用の調べもの材料を集める。"""
+    parts = []
+    info = _roblox_game_info("Anime Adventures")
+    if info:
+        parts.append(info)
+    codes = _aa_page_text("Codes")
+    if codes:
+        i = codes.lower().find("active")
+        seg = codes[i:i + 1100] if i >= 0 else codes[:1100]
+        parts.append("Wikiのコードページ（英語）:\n" + seg)
+    uq = _aa_unit_query(text)
+    if uq:
+        titles = [t for t in _aa_search(uq) if not any(s in t for s in _AA_SKIP_TITLES)]
+        if titles:
+            t = _aa_page_text(titles[0])
+            if t:
+                parts.append(f"キャラ「{titles[0]}」のWiki情報（英語）:\n" + t[:1800])
+    for q in ("Anime Adventures update 21 new units patch notes", "Anime Adventures next update update 22"):
+        try:
+            r = _web_search(q)
+            if r:
+                parts.append(f"Web検索「{q}」:\n" + r)
+        except Exception:
+            pass
+    return "\n\n".join(parts)
+
+
 def _game_update_lookup(text: str) -> str:
     """ゲームの最新アップデート情報を、Roblox公式情報＋Web検索で集める。"""
     title = text
@@ -1534,6 +1766,11 @@ def _fixed_update_reply(text: str) -> str | None:
 
 def _lookup_context(text: str) -> tuple[str, str]:
     """発言内容を見て、必要な調べものを実行し (種類, 結果テキスト) を返す。"""
+    if _is_aa_question(text):
+        ctx = _aa_context(text)
+        if ctx:
+            print("[調べもの] アニメアドベンチャー情報を収集", flush=True)
+            return "アニメアドベンチャー", ctx
     if _is_fortnite_question(text):
         return "Fortnite", _fortnite_context(text)
     if _is_update_question(text):
