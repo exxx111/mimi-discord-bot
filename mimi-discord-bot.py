@@ -893,6 +893,11 @@ def _game_guide_lookup(eng: str) -> list[str]:
                 j = aplain.find("Unit Rarity")
             if j >= 0:
                 parts.append("最新アプデの新ユニット（英語サイト）: " + aplain[j:j + 1500])
+            # 記事内の「コードの答え」の段落も拾う（次のアプデでも同じ形式で出る）
+            cocc = [mm.start() for mm in re.finditer(r"What are the .*? codes\?", aplain)]
+            k = cocc[1] if len(cocc) >= 2 else -1
+            if k >= 0:
+                parts.append("最新アプデのコード解説（英語サイト）: " + aplain[k:k + 1200])
         except Exception as e:
             print(f"[調べもの] アプデ記事の取得に失敗: {e}")
     return parts
