@@ -459,24 +459,36 @@ def _openrouter_vision_call(model: str, prompt: str, mime: str, b64: str, timeou
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.load(resp)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {body}") from e
     choices = data.get("choices") or []
     if not choices:
         return ""
     content = choices[0].get("message", {}).get("content", "")
+    if isinstance(content, list):
+        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
     return content.strip() if isinstance(content, str) else ""
 
 
 def _openrouter_vision_generate(prompt: str, mime: str, data: bytes, user_id: int | None = None) -> str:
-    """OpenRouterの無料画像モデルを順に試す（最大約60秒）。全部ダメなら例外。"""
+    """OpenRouterの無料画像モデルを順に試す（最大約90秒）。全部ダメなら例外。"""
     b64 = base64.b64encode(data).decode("ascii")
-    models = _openrouter_vision_models()
+    models = list(_openrouter_vision_models())
+    if "openrouter/free" not in models:
+        models.append("openrouter/free")
     if not models:
         raise RuntimeError("no free vision models on OpenRouter")
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + 90
     last_err: Exception | None = None
-    for model in models[:4]:
+    for model in models[:6]:
         if time.monotonic() > deadline:
             break
         try:
@@ -484,12 +496,10 @@ def _openrouter_vision_generate(prompt: str, mime: str, data: bytes, user_id: in
             if text:
                 print(f"[AI] 使用モデル: OpenRouter {model}（画像）", flush=True)
                 return text
-        except urllib.error.HTTPError as e:
+            print(f"[AI] OpenRouter {model} は空の返答でした", flush=True)
+        except Exception as e:
             last_err = e
-            if e.code in (401, 403):
-                raise
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last_err = e
+            print(f"[AI] OpenRouter {model} 失敗: {e}", flush=True)
     raise RuntimeError(f"OpenRouter vision failed: {last_err}")
 
 
