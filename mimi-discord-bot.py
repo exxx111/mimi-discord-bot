@@ -24,8 +24,10 @@ Render等のWebサービスで動かす場合:
 指定した監視ワード）は🚨検知つきで記録するよ（消したりBANはしないよ）。
 ログは「mimi-log」「みみログ」「spam-log」「警告botログ」「tempusログ」という名前のチャンネルがあればそこにも流すよ。
 🚨検知したログはクラウド（Firestore）にも保存するので、再起動しても消えないよ（起動時に復元して /log や21時のレポートで見返せる）。
+画像つきで話しかけられたら、Geminiで画像を見て答えるよ（Geminiが混んでいると見れないこともある）。
 """
 
+import base64
 import json
 import os
 import re
@@ -383,7 +385,76 @@ async def ai_reply(user_id: int, text: str) -> str | None:
     return reply[:1000]
 
 
-async def smart_reply(user_id: int, text: str) -> str:
+def _gemini_vision_call(model: str, prompt: str, mime: str, b64: str, timeout: float = 20, user_id: int | None = None) -> str:
+    """Geminiに画像を見せて答えてもらう（1回分）。"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    payload = {
+        "system_instruction": {"parts": [{"text": _system_prompt(user_id)}]},
+        "contents": [
+            {"role": "user", "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime, "data": b64}},
+            ]}
+        ],
+        "generationConfig": {"maxOutputTokens": 1600, "temperature": 0.8},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.load(resp)
+    texts: list[str] = []
+    for cand in data.get("candidates", []):
+        for part in cand.get("content", {}).get("parts", []):
+            texts.append(part.get("text", ""))
+    return "".join(texts).strip()
+
+
+def _gemini_vision_generate(prompt: str, mime: str, data: bytes, user_id: int | None = None) -> str:
+    """画像つきでGeminiを呼ぶ。モデルを替えながら最大約40秒粘る。"""
+    b64 = base64.b64encode(data).decode("ascii")
+    deadline = time.monotonic() + 40
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        for model in GEMINI_MODELS:
+            try:
+                text = _gemini_vision_call(model, prompt, mime, b64, timeout=20, user_id=user_id)
+                if text:
+                    print(f"[AI] 使用モデル: Gemini {model}（画像）", flush=True)
+                    return text
+            except urllib.error.HTTPError as e:
+                last_err = e
+                if e.code not in (400, 404, 429, 503):
+                    raise
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last_err = e
+        if time.monotonic() + 5 < deadline:
+            time.sleep(5)
+    raise RuntimeError(f"Gemini vision failed: {last_err}")
+
+
+async def _vision_reply(user_id: int, text: str, image: tuple[bytes, str]) -> str | None:
+    """画像を見て答える。失敗したら None。"""
+    data, mime = image
+    prompt = text.strip() or "この画像に何が写っているか教えて"
+    try:
+        reply = await asyncio.to_thread(_gemini_vision_generate, prompt, mime, data, user_id)
+    except Exception as e:
+        print(f"[AI] 画像の呼び出しに失敗: {e}", flush=True)
+        return None
+    if not reply:
+        return None
+    history = _ai_history[user_id]
+    history.append(("user", f"（画像を送った）{text}"))
+    history.append(("ai", reply))
+    del history[:-24]
+    return reply[:1000]
+
+
+async def smart_reply(user_id: int, text: str, image: tuple[bytes, str] | None = None) -> str:
     """名前を覚える処理はルールで、会話はAI（あれば）→ダメならルール返信。"""
     m = re.search(r"名前は\s*(.+)", text.strip())
     if m:
@@ -392,6 +463,13 @@ async def smart_reply(user_id: int, text: str) -> str:
             user_names[user_id] = name
             _save_name_bg(user_id, name)
             return f"{name}って言うんだね！覚えたよ♪ よろしく、{name}！"
+    if image is not None:
+        if GEMINI_API_KEY:
+            reply = await _vision_reply(user_id, text, image)
+            if reply:
+                return reply
+            return "画像を見ようとしたんだけど、今は画像を見るAI（Gemini）が混んでて見れなかった…また後で試してみて！"
+        return "ごめん、今は画像を見る準備ができてないや…"
     if GROQ_API_KEY or GEMINI_API_KEY:
         reply = await ai_reply(user_id, text)
         if reply:
@@ -1442,8 +1520,20 @@ async def on_message(message: discord.Message):
             _schedule_reminder(message, seconds, note)
             await send_thoughtful_reply(message, f"おけ！{label}に知らせるね。", clean)
             return
+        image = None
+        for att in message.attachments:
+            ct = att.content_type or ""
+            if ct.startswith("image/"):
+                if att.size and att.size > 10_000_000:
+                    await send_thoughtful_reply(message, "その画像、ちょっと大きすぎて見れないや…（10MBまでだよ）", clean)
+                    return
+                try:
+                    image = (await att.read(), ct.split(";")[0])
+                except Exception as e:
+                    print(f"[AI] 画像の読み取りに失敗: {e}", flush=True)
+                break
         async with message.channel.typing():
-            reply = await smart_reply(message.author.id, clean or "こんにちは")
+            reply = await smart_reply(message.author.id, clean or ("" if image else "こんにちは"), image)
         if reply:
             await send_thoughtful_reply(message, reply, clean)
         return
