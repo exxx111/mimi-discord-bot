@@ -805,7 +805,7 @@ _GAME_ALIASES = {
     "ヴェンカード": "Anime Vanguards",
 }
 _GAME_WIKIS = {
-    "Anime Vanguards": "https://animevanguards.fandom.com/wiki/Update_Log",
+    "Anime Vanguards": "https://wiki.vanguards.gg/Update_Log",
 }
 
 
@@ -888,15 +888,15 @@ def _game_update_lookup(text: str) -> str:
         parts.append(r)
         break
     wiki_url = _GAME_WIKIS.get(eng)
-    if wiki_url and not info:
+    if wiki_url:
         try:
             page = _http_get_text(wiki_url, timeout=12)
             plain = _strip_tags(re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S))
             plain = re.sub(r"\s+", " ", plain)
-            m = re.search(r"(Update|アップデート)", plain)
-            seg = plain[m.start():m.start() + 1500] if m else plain[:1500]
+            m = re.search(r"archive of all update additions", plain) or re.search(r"(Update|アップデート)", plain)
+            seg = plain[m.start():m.start() + 1600] if m else plain[:1600]
             if seg:
-                parts.append(f"Wiki更新ログ（{eng}）: {seg}")
+                parts.append(f"公式Wiki更新一覧（英語）: {seg}")
         except Exception as e:
             print(f"[調べもの] Wiki更新ログの取得に失敗: {e}")
     print(f"[調べもの] アプデ情報: {title or text} -> {eng or '-'}", flush=True)
