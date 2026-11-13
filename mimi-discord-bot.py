@@ -585,6 +585,7 @@ async def ai_reply(user_id: int, text: str) -> str | None:
             history.append(("user", text))
             history.append(("ai", fixed_aa))
             del history[:-24]
+            _save_history_bg(user_id)
             return fixed_aa
         if any(w in text for w in ("アプデ", "アップデート", "最新", "コード", "新ユニット", "次回", "次の")):
             fixed_upd = await asyncio.to_thread(_aa_update_reply)
@@ -593,6 +594,7 @@ async def ai_reply(user_id: int, text: str) -> str | None:
                 history.append(("user", text))
                 history.append(("ai", fixed_upd))
                 del history[:-24]
+                _save_history_bg(user_id)
                 return fixed_upd
     if _is_fortnite_question(text) and not _fortnite_has_strategy(text) and user_langs.get(user_id) in (None, "ja"):
         fixed_fn = await asyncio.to_thread(_fortnite_fixed_reply, text)
@@ -601,6 +603,7 @@ async def ai_reply(user_id: int, text: str) -> str | None:
             history.append(("user", text))
             history.append(("ai", fixed_fn))
             del history[:-24]
+            _save_history_bg(user_id)
             return fixed_fn
     if _is_update_question(text) and user_langs.get(user_id) in (None, "ja"):
         fixed = await asyncio.to_thread(_fixed_update_reply, text)
@@ -609,6 +612,7 @@ async def ai_reply(user_id: int, text: str) -> str | None:
             history.append(("user", text))
             history.append(("ai", fixed))
             del history[:-24]
+            _save_history_bg(user_id)
             return fixed
     kind, ctx = await asyncio.to_thread(_lookup_context, text)
     if ctx:
@@ -632,6 +636,7 @@ async def ai_reply(user_id: int, text: str) -> str | None:
     history.append(("user", text))
     history.append(("ai", reply))
     del history[:-24]  # 直近のやりとりだけ覚える
+    _save_history_bg(user_id)
     return reply[:1000]
 
 
@@ -831,6 +836,7 @@ async def _vision_reply(user_id: int, text: str, image: tuple[bytes, str]) -> st
     history.append(("user", f"（画像を送った）{text}"))
     history.append(("ai", reply))
     del history[:-24]
+    _save_history_bg(user_id)
     return reply[:1000]
 
 
@@ -2799,6 +2805,86 @@ async def _restore_langs_once() -> None:
         print("[言語] 復元する言語設定はありませんでした", flush=True)
 
 
+# ---------- 会話履歴のクラウド保存（再起動・再デプロイでも会話が途中で消えないように） ----------
+_FS_HISTORY_URL = (
+    f"https://firestore.googleapis.com/v1/projects/{_FS_PROJECT}"
+    f"/databases/(default)/documents/bothistory?key={_FS_API_KEY}"
+)
+_history_loaded = False
+
+
+def _save_history_to_cloud(user_id: int) -> None:
+    """そのユーザーの会話履歴（直近24件）を Firestore に保存する（失敗しても例外を出さない）。"""
+    items = list(_ai_history.get(user_id, []))[-24:]
+    if not items:
+        return
+    try:
+        payload = json.dumps([[w, b[:500]] for w, b in items], ensure_ascii=False)
+        fields = {
+            "ts": {"integerValue": str(int(time.time()))},
+            "user_id": {"integerValue": str(user_id)},
+            "hist": _fs_str(payload),
+        }
+        req = urllib.request.Request(
+            _FS_HISTORY_URL,
+            data=json.dumps({"fields": fields}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp.read()
+    except Exception as e:
+        print(f"[履歴] 会話履歴の保存に失敗: {e}", flush=True)
+
+
+def _save_history_bg(user_id: int) -> None:
+    threading.Thread(target=_save_history_to_cloud, args=(user_id,), daemon=True).start()
+
+
+def _load_history_from_cloud(limit: int = 200) -> dict[int, list[tuple[str, str]]]:
+    """保存済みの会話履歴を読み戻す（ユーザーごとに最新のものを採用）。"""
+    try:
+        url = _FS_HISTORY_URL + f"&pageSize={limit}&orderBy=ts%20desc"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; mimi-discord-bot/1.0)"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        print(f"[履歴] 会話履歴の読み戻しに失敗: {e}", flush=True)
+        return {}
+    out: dict[int, list[tuple[str, str]]] = {}
+    for doc in data.get("documents", []):
+        f = doc.get("fields", {})
+        try:
+            uid = int(f.get("user_id", {}).get("integerValue", "0") or 0)
+        except Exception:
+            uid = 0
+        raw = f.get("hist", {}).get("stringValue", "")
+        if not uid or not raw or uid in out:
+            continue
+        try:
+            items = json.loads(raw)
+            out[uid] = [(str(w), str(b)) for w, b in items if w in ("user", "ai")][-24:]
+        except Exception:
+            continue
+    return out
+
+
+async def _restore_history_once() -> None:
+    """起動時に1回だけ、保存済みの会話履歴を _ai_history に復元する。"""
+    global _history_loaded
+    if _history_loaded:
+        return
+    _history_loaded = True
+    hist = await asyncio.to_thread(_load_history_from_cloud)
+    if hist:
+        for uid, items in hist.items():
+            if items:
+                _ai_history[uid] = items
+        print(f"[履歴] 会話履歴を{len(hist)}人分復元しました", flush=True)
+    else:
+        print("[履歴] 復元する会話履歴はありませんでした", flush=True)
+
+
 # ---------- 荒らし・メンバー監視 ----------
 _member_flag_times: dict[tuple[int, int], list[float]] = defaultdict(list)
 _member_channels: dict[tuple[int, int], list] = defaultdict(list)
@@ -3004,7 +3090,7 @@ async def _ensis_daily_loop() -> None:
     while True:
         await asyncio.sleep(60)
         now = datetime.now(JST)
-        if now.hour == ENSIS_HOUR and now.minute <= 4:
+        if now.hour == ENSIS_HOUR and now.minute <= 20:
             today = now.strftime("%Y-%m-%d")
             if _ensis_last_day == today:
                 continue
@@ -3096,6 +3182,7 @@ async def on_ready():
     asyncio.create_task(_restore_cloud_log_once())
     asyncio.create_task(_restore_names_once())
     asyncio.create_task(_restore_langs_once())
+    asyncio.create_task(_restore_history_once())
     if not _maintenance_started:
         _maintenance_started = True
         asyncio.create_task(_maintenance_loop())
